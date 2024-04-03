@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_BACKENDS_PROFILER_GPU_CUPTI_COLLECTOR_H_
 
 #include <cstdint>
+#include <list>
 #include <memory>
 
 #include "xla/backends/profiler/gpu/cupti_buffer_events.h"
@@ -41,8 +42,7 @@ struct CuptiTracerCollectorOptions {
 class CuptiTraceCollector {
  public:
   explicit CuptiTraceCollector(const CuptiTracerCollectorOptions& options)
-      : options_(options),
-        annotation_map_(options.max_annotation_strings, options.num_gpus) {}
+      : options_(options) {}
   virtual ~CuptiTraceCollector() {}
 
   // Producer side functions (i.e. called by CuptiTracer).
@@ -50,6 +50,19 @@ class CuptiTraceCollector {
   virtual void OnEventsDropped(const std::string& reason,
                                uint32_t num_events) = 0;
   virtual void Flush() = 0;
+
+  // After CuptiTracer stop, collected per-thread callback data from threads,
+  // merged annotation map will be send here. Collector must save the
+  // annotation map as later buffered activity events will use them. For
+  // callback events,  default behavior is direct process them and recorder
+  // them by calling AddEvent().
+  // Yet collector could just save those callback events without processing now,
+  // but process and AddEvent() later when needed, such as during export().
+  // This could make the profiling stop() timestamp, if used by upper
+  // level wrapper, do not contains time used by exporting events.
+  virtual void OnTracerCollectedCallbackData(
+      AnnotationMap annotation_map,
+      std::list<std::shared_ptr<CallbackAnnotationsAndEvents>> callback_events);
 
   // CuptiTracer tracer now cache all activity buffers during tracing.
   // After tracing stop, the cached activity buffers will be send here.

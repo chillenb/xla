@@ -376,7 +376,8 @@ static Status ConvertActivityBuffer(CuptiEventCollectorDelegate &collector,
     CUptiResult status =
         cupti_interface->ActivityGetNextRecord(buffer, size, &record);
     if (status == CUPTI_SUCCESS) {
-      if (total_activity_event_count >= max_activity_event_count) {
+      if (max_activity_event_count > 0 &&
+          total_activity_event_count >= max_activity_event_count) {
         dropped_activity_event_count++;
         continue;
       }
@@ -441,33 +442,30 @@ static Status ConvertActivityBuffer(CuptiEventCollectorDelegate &collector,
 
 }  // namespace
 
-void AnnotationMap::Add(uint32_t device_id, uint32_t correlation_id,
-                        const absl::string_view annotation,
-                        const absl::string_view nvtx_range) {
-  if (annotation.empty() && nvtx_range.empty()) return;
-  VLOG(3) << "Add annotation: device_id: " << device_id
-          << " correlation_id: " << correlation_id
-          << " annotation: " << annotation;
-  if (device_id >= per_device_map_.size()) return;
-  auto &per_device_map = per_device_map_[device_id];
-  tsl::mutex_lock lock(per_device_map.mutex);
-  if (per_device_map.annotations.size() < max_size_) {
-    AnnotationInfo info;
-    info.annotation = *per_device_map.annotations.emplace(annotation).first;
-    if (!nvtx_range.empty())
-      info.nvtx_range = *per_device_map.nvtx_ranges.emplace(nvtx_range).first;
-    per_device_map.correlation_map.emplace(correlation_id, info);
-  }
+absl::string_view StringDeduper::Dedup(absl::string_view str,
+                                       size_t max_unique_count) {
+  if (str.empty()) return absl::string_view();
+  if (max_unique_count == 0 || strings_.size() < max_unique_count)
+    return *strings_.emplace(str).first;
+  auto it = strings_.find(str);
+  if (it != strings_.end()) return *it;
+  return absl::string_view();
 }
 
-AnnotationMap::AnnotationInfo AnnotationMap::LookUp(uint32_t device_id,
-                                                    uint32_t correlation_id) {
-  if (device_id >= per_device_map_.size()) return AnnotationInfo();
-  auto &per_device_map = per_device_map_[device_id];
-  tsl::mutex_lock lock(per_device_map.mutex);
-  auto it = per_device_map.correlation_map.find(correlation_id);
-  return it != per_device_map.correlation_map.end() ? it->second
-                                                    : AnnotationInfo();
+void AnnotationMap::AddAnnotation(uint32_t correlation_id,
+                                  absl::string_view annotation,
+                                  absl::string_view nvtx_range) {
+  auto annotation_view = string_deduper_.Dedup(annotation);
+  auto nvtx_range_view = string_deduper_.Dedup(nvtx_range);
+  if (annotation_view.empty() && nvtx_range_view.empty()) return;
+  map_.emplace(correlation_id,
+               AnnotationInfo{annotation_view, nvtx_range_view});
+}
+
+AnnotationMap::AnnotationInfo AnnotationMap::LookUp(
+    uint32_t device_id, uint32_t correlation_id) const {
+  const auto it = map_.find(correlation_id);
+  return it != map_.end() ? it->second : AnnotationInfo();
 }
 
 CuptiActivityBufferManager::ActivityBufferAndSize::ActivityBufferAndSize(
@@ -494,6 +492,130 @@ void CuptiActivityBufferManager::AddCachedActivityEventsTo(
                           dropped_activity_event_count)
         .IgnoreError();
   }
+}
+
+template <typename T>
+AppendOnlyBuffer<T>::AppendOnlyBuffer(size_t block_size)
+    : block_size_(std::max((size_t)1024, block_size)) {
+  Clear();
+}
+
+template <typename T>
+AppendOnlyBuffer<T>::AppendOnlyBuffer(AppendOnlyBuffer &&another)
+    : block_size_(another.block_size_),
+      size_(another.size_),
+      front_index_(another.front_index_),
+      block_list_(std::move(another.block_list_)) {
+  another.Clear();
+}
+
+template <typename T>
+AppendOnlyBuffer<T> &AppendOnlyBuffer<T>::operator=(
+    AppendOnlyBuffer &&another) {
+  block_size_ = another.block_size_;
+  size_ = another.size_;
+  front_index_ = another.front_index_;
+  block_list_.clear();
+  block_list_ = std::move(another.block_list_);
+  another.Clear();
+  return *this;
+}
+
+template <typename T>
+void AppendOnlyBuffer<T>::Clear() {
+  size_ = 0;
+  front_index_ = 0;
+  block_list_.clear();
+}
+
+template <typename T>
+T &AppendOnlyBuffer<T>::Back() {
+  DCHECK_GT(size_, 0);
+  return block_list_.back().back();
+}
+
+template <typename T>
+T &AppendOnlyBuffer<T>::Front() {
+  DCHECK_GT(size_, 0);
+  return block_list_.front()[front_index_];
+}
+
+template <typename T>
+void AppendOnlyBuffer<T>::PopFront() {
+  if (size_ > 0) {
+    if (++front_index_ >= block_list_.front().size()) {
+      front_index_ = 0;
+      block_list_.pop_front();
+    }
+    --size_;
+  }
+}
+
+template <typename T>
+void AppendOnlyBuffer<T>::ForEach(std::function<void(T &)> func) {
+  size_t head_index = front_index_;
+  for (auto &block : block_list_) {
+    for (auto it = block.begin() + head_index; it != block.end(); ++it) {
+      func(*it);
+    }
+    head_index = 0;
+  }
+}
+
+// Explicit instantiation.
+template class AppendOnlyBuffer<
+    CallbackAnnotationsAndEvents::EventWithAnnotation>;
+
+CallbackAnnotationsAndEvents::CallbackAnnotationsAndEvents(
+    CallbackAnnotationsAndEvents &&another)
+    : annotations_(std::move(another.annotations_)),
+      nvtx_ranges_(std::move(another.nvtx_ranges_)),
+      num_dropped_events_(another.num_dropped_events_),
+      event_annotation_buffer_(std::move(another.event_annotation_buffer_)) {
+  another.clear();
+}
+
+CallbackAnnotationsAndEvents &CallbackAnnotationsAndEvents::operator=(
+    CallbackAnnotationsAndEvents &&another) {
+  annotations_ = std::move(another.annotations_);
+  nvtx_ranges_ = std::move(another.nvtx_ranges_);
+  event_annotation_buffer_ = std::move(another.event_annotation_buffer_);
+  num_dropped_events_ = another.num_dropped_events_;
+  another.clear();
+  return *this;
+}
+
+bool CallbackAnnotationsAndEvents::Add(
+    uint32_t device_id, uint32_t correlation_id,
+    const absl::string_view annotation, const absl::string_view nvtx_range,
+    size_t max_annotation_strings, size_t max_callback_api_events,
+    std::atomic<size_t> &callback_api_event_count) {
+  if (max_callback_api_events == 0 ||
+      callback_api_event_count < max_callback_api_events) {
+    callback_api_event_count++;
+    // Some logic change as no cross thread string comparison should be
+    // make here. The max_annotation_string is used to limit per-thread
+    // annotation string count. And annotation string is not collected
+    // if total callback event could overflow.
+    bool too_many_annotations = (max_annotation_strings > 0) &&
+                                (annotations_.size() >= max_annotation_strings);
+    event_annotation_buffer_.EmplaceBack(
+        correlation_id,
+        annotations_.Dedup(too_many_annotations ? absl::string_view()
+                                                : annotation),
+        nvtx_ranges_.Dedup(too_many_annotations ? absl::string_view()
+                                                : nvtx_range));
+    return true;
+  }
+  num_dropped_events_++;
+  return false;
+}
+
+void CallbackAnnotationsAndEvents::clear() {
+  annotations_.clear();
+  nvtx_ranges_.clear();
+  num_dropped_events_ = 0;
+  event_annotation_buffer_.Clear();
 }
 
 }  // namespace profiler

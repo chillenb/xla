@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_BACKENDS_PROFILER_GPU_CUPTI_BUFFER_EVENTS_H_
 #define XLA_BACKENDS_PROFILER_GPU_CUPTI_BUFFER_EVENTS_H_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -24,8 +25,8 @@ limitations under the License.
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
-#include "absl/container/fixed_array.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/node_hash_set.h"
 #include "absl/strings/str_cat.h"
@@ -128,7 +129,7 @@ struct KernelDetails {
   int8_t channel_type = 0;  // CUPTI_CHANNEL_TYPE_INVALID
 };
 
-inline std::string ToXStat(const KernelDetails& kernel_info,
+inline std::string ToXStat(const KernelDetails &kernel_info,
                            double occupancy_pct) {
   return absl::StrCat(
       "regs:", kernel_info.registers_per_thread,
@@ -162,7 +163,7 @@ enum class CuptiTracerEventType {
   Generic = 100,
 };
 
-const char* GetTraceEventTypeName(const CuptiTracerEventType& type);
+const char *GetTraceEventTypeName(const CuptiTracerEventType &type);
 
 enum class CuptiTracerEventSource {
   Invalid = 0,
@@ -217,6 +218,16 @@ struct CuptiTracerEvent {
   };
 };
 
+class StringDeduper {
+ public:
+  void clear() { strings_.clear(); }
+  absl::string_view Dedup(absl::string_view str, size_t max_unique_count = 0);
+  size_t size() const { return strings_.size(); }
+
+ private:
+  absl::node_hash_set<std::string> strings_;
+};
+
 class AnnotationMap {
  public:
   struct AnnotationInfo {
@@ -224,46 +235,35 @@ class AnnotationMap {
     absl::string_view nvtx_range;
   };
 
-  explicit AnnotationMap(uint64_t max_size, uint32_t num_gpus)
-      : max_size_(max_size), per_device_map_(num_gpus) {}
-  void Add(uint32_t device_id, uint32_t correlation_id,
-           absl::string_view annotation, absl::string_view nvtx_range);
-  AnnotationInfo LookUp(uint32_t device_id, uint32_t correlation_id);
+  void clear() {
+    map_.clear();
+    string_deduper_.clear();
+  }
+  size_t size() const { return map_.size(); }
+  void AddAnnotation(uint32_t correlation_id, absl::string_view annotation,
+                     absl::string_view nvtx_range);
+  AnnotationInfo LookUp(uint32_t device_id, uint32_t correlation_id) const;
 
  private:
-  struct PerDeviceAnnotationMap {
-    // The population/consumption of annotations might happen from multiple
-    // callback/activity api related threads.
-    tsl::mutex mutex;
-    // Annotation tends to be repetitive, use a hash_set to store the strings,
-    // an use the reference to the string in the map.
-    absl::node_hash_set<std::string> annotations TF_GUARDED_BY(mutex);
-    absl::node_hash_set<std::string> nvtx_ranges TF_GUARDED_BY(mutex);
-    absl::flat_hash_map<uint32_t, AnnotationInfo> correlation_map
-        TF_GUARDED_BY(mutex);
-  };
-  const uint64_t max_size_;
-  absl::FixedArray<PerDeviceAnnotationMap> per_device_map_;
-
-  AnnotationMap(const AnnotationMap&) = delete;
-  void operator=(const AnnotationMap&) = delete;
+  StringDeduper string_deduper_;
+  absl::flat_hash_map<uint32_t, AnnotationInfo> map_;
 };
 
 struct CuptiEventCollectorDelegate {
-  AnnotationMap& annotation_map;
-  std::function<void(CuptiTracerEvent&&)> receive;
+  AnnotationMap &annotation_map;
+  std::function<void(CuptiTracerEvent &&)> receive;
   explicit CuptiEventCollectorDelegate(
-      AnnotationMap& p_annotation_map,
-      std::function<void(CuptiTracerEvent&&)> p_receive)
+      AnnotationMap &p_annotation_map,
+      std::function<void(CuptiTracerEvent &&)> p_receive)
       : annotation_map(p_annotation_map), receive(std::move(p_receive)) {}
 };
 
 class CuptiActivityBufferManager {
  public:
   struct ActivityBufferAndSize {
-    std::unique_ptr<uint8_t, std::function<void(uint8_t*)>> buffer;
+    std::unique_ptr<uint8_t, std::function<void(uint8_t *)>> buffer;
     size_t size;  // size in bytes for the events filled by CUPTI.
-    explicit ActivityBufferAndSize(uint8_t* p = nullptr, size_t sz = 0);
+    explicit ActivityBufferAndSize(uint8_t *p = nullptr, size_t sz = 0);
   };
 
   explicit CuptiActivityBufferManager(size_t buffer_size_in_bytes)
@@ -271,23 +271,131 @@ class CuptiActivityBufferManager {
 
   size_t GetBufferSizeInBytes() { return buffer_pool_.GetBufferSizeInBytes(); }
 
-  uint8_t* GetOrCreateBuffer() { return buffer_pool_.GetOrCreateBuffer(); }
+  uint8_t *GetOrCreateBuffer() { return buffer_pool_.GetOrCreateBuffer(); }
 
-  void ReclaimBuffer(uint8_t* p) { buffer_pool_.ReclaimBuffer(p); }
+  void ReclaimBuffer(uint8_t *p) { buffer_pool_.ReclaimBuffer(p); }
 
-  void CacheCuptiFilledActivityBuffer(uint8_t* p, size_t sz) {
+  void CacheCuptiFilledActivityBuffer(uint8_t *p, size_t sz) {
     tsl::mutex_lock lock(buffer_mutex_);
     cached_buffers_.emplace_back(p, sz);
   }
 
-  void AddCachedActivityEventsTo(CuptiEventCollectorDelegate& receiver,
+  void AddCachedActivityEventsTo(CuptiEventCollectorDelegate &receiver,
                                  size_t max_activity_event_count,
-                                 size_t& dropped_activity_event_count);
+                                 size_t &dropped_activity_event_count);
 
  private:
   tsl::profiler::BufferPool buffer_pool_;
   tsl::mutex buffer_mutex_;
   std::list<ActivityBufferAndSize> cached_buffers_ TF_GUARDED_BY(buffer_mutex_);
+};
+
+// In tracing, new events are append to buffers. Key requirement is high
+// speed and no disturbance. One of the candidate container for such request
+// is Deque, which internally using blocked storage. But its default
+// implementation uses small block size - like 8, which cause lot of memory
+// allocation and hence introduce negative impact to the speed. And there is
+// no api to control deque's internal block size. So simple AppendOnlyBuffer
+// is implemented here. This class uses list of vector as interneal container.
+// It provides:
+//    * Back() and EmplaceBack() to append or access the last element.
+//    * Front() and PopFront() to access elements one by one, more important
+//          here is that whole visited block will be free to keep small memory
+//          footprint.
+//     * ForEach() to access each elements using std::function.
+template <typename T>
+class AppendOnlyBuffer {
+ public:
+  static constexpr size_t kBlockSize = 32768;
+
+  explicit AppendOnlyBuffer(size_t block_size = kBlockSize);
+
+  AppendOnlyBuffer(AppendOnlyBuffer &&another);
+
+  AppendOnlyBuffer &operator=(AppendOnlyBuffer &&another);
+
+  void Clear();
+
+  size_t Size() const { return size_; }
+
+  bool Empty() const { return size_ == 0; }
+
+  T &Front();
+
+  void PopFront();
+
+  T &Back();
+
+  void ForEach(std::function<void(T &)> func);
+
+  template <typename... Params>
+  void EmplaceBack(Params... params) {
+    Block *last_block =
+        (block_list_.empty() || block_list_.back().size() >= block_size_)
+            ? nullptr
+            : &block_list_.back();
+    if (last_block == nullptr) {
+      last_block = &(block_list_.emplace_back());
+      last_block->reserve(block_size_);
+    }
+    last_block->emplace_back(std::forward<Params>(params)...);
+    size_++;
+  }
+
+ private:
+  using Block = std::vector<T>;
+  using BlockList = std::list<Block>;
+
+  size_t block_size_ = kBlockSize;
+  size_t size_ = 0;
+  size_t front_index_ = 0;  // index of the front element in the first block.
+  BlockList block_list_;
+};
+
+class CallbackAnnotationsAndEvents {
+ public:
+  struct EventWithAnnotation {
+    uint32_t correlation_id = 0;
+    absl::string_view annotation;
+    absl::string_view nvtx_range;
+    CuptiTracerEvent event = {};
+
+    EventWithAnnotation() = default;
+
+    EventWithAnnotation(uint32_t corr_id, absl::string_view ann,
+                        absl::string_view nvtx)
+        : correlation_id(corr_id), annotation(ann), nvtx_range(nvtx) {}
+  };
+
+  CallbackAnnotationsAndEvents() = default;
+
+  CallbackAnnotationsAndEvents(CallbackAnnotationsAndEvents &&another);
+
+  CallbackAnnotationsAndEvents &operator=(
+      CallbackAnnotationsAndEvents &&another);
+
+  void clear();
+
+  // Add an empty event with annotation and nvtx_range to the buffer.
+  // return true if added, or false if the event is dropped
+  bool Add(uint32_t device_id, uint32_t correlation_id,
+           absl::string_view annotation, absl::string_view nvtx_range,
+           size_t max_annotation_strings, size_t max_callback_api_events,
+           std::atomic<size_t> &callback_api_event_count);
+
+  AppendOnlyBuffer<EventWithAnnotation> &event_annotation_buffer() {
+    return event_annotation_buffer_;
+  }
+
+  size_t num_dropped_events() { return num_dropped_events_; }
+
+ private:
+  // Annotation tends to be repetitive, use a hash_set to store the strings,
+  // an use the reference to the string in the map.
+  StringDeduper annotations_;
+  StringDeduper nvtx_ranges_;
+  size_t num_dropped_events_ = 0;
+  AppendOnlyBuffer<EventWithAnnotation> event_annotation_buffer_;
 };
 
 }  // namespace profiler

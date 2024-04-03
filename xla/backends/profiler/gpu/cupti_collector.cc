@@ -25,6 +25,7 @@ limitations under the License.
 #include "third_party/gpus/cuda/include/cuda_occupancy.h"
 #include "tsl/platform/abi.h"
 #include "tsl/platform/host_info.h"
+#include "tsl/platform/mem.h"
 #include "tsl/platform/mutex.h"
 #include "tsl/profiler/utils/parse_annotation.h"
 #include "tsl/profiler/utils/trace_utils.h"
@@ -466,20 +467,49 @@ class PerDeviceCollector {
   absl::flat_hash_map<DeviceOccupancyParams, OccupancyStats> occupancy_cache_;
 };
 
+CuptiEventCollectorDelegate GetDelegate(CuptiTraceCollector* collector) {
+  return CuptiEventCollectorDelegate(*collector->annotation_map(),
+                                     [collector](CuptiTracerEvent&& ev) {
+                                       collector->AddEvent(std::move(ev));
+                                     });
+};
+
 }  // namespace
 
 void CuptiTraceCollector::OnTracerCachedActivityBuffers(
     std::unique_ptr<CuptiActivityBufferManager> activity_buffers) {
   size_t dropped_activity_event_count = 0;
-  CuptiEventCollectorDelegate collector(
-      *annotation_map(),
-      [this](CuptiTracerEvent&& ev) { this->AddEvent(std::move(ev)); });
+  auto collector = GetDelegate(this);
   activity_buffers->AddCachedActivityEventsTo(collector,
                                               options_.max_activity_api_events,
                                               dropped_activity_event_count);
   if (dropped_activity_event_count > 0) {
     OnEventsDropped("total device(activity) events reaches max",
                     dropped_activity_event_count);
+  }
+}
+
+void CuptiTraceCollector::OnTracerCollectedCallbackData(
+    AnnotationMap merged_annotation_map,
+    std::list<std::shared_ptr<CallbackAnnotationsAndEvents>>
+        callback_annotations_and_events) {
+  annotation_map_ = std::move(merged_annotation_map);
+  size_t total_dropped_callback_event_count = 0;
+  while (!callback_annotations_and_events.empty()) {
+    auto& annotations_and_events = callback_annotations_and_events.front();
+    auto& buffer = annotations_and_events->event_annotation_buffer();
+    while (!buffer.Empty()) {
+      auto& event_with_annotation = buffer.Front();
+      AddEvent(std::move(event_with_annotation.event));
+      buffer.PopFront();
+    }
+    total_dropped_callback_event_count +=
+        annotations_and_events->num_dropped_events();
+    callback_annotations_and_events.pop_front();
+  }
+  if (total_dropped_callback_event_count > 0) {
+    OnEventsDropped("total driver(callback) events reaches max",
+                    total_dropped_callback_event_count);
   }
 }
 
@@ -500,16 +530,8 @@ class CuptiTraceCollectorImpl : public CuptiTraceCollector {
   void AddEvent(CuptiTracerEvent&& event) override {
     if (event.device_id >= num_gpus_) return;
     if (event.source == CuptiTracerEventSource::DriverCallback) {
-      if (num_callback_events_ > options_.max_callback_api_events) {
-        OnEventsDropped("total driver(callback) events reaches max", 1);
-        return;
-      }
       num_callback_events_++;
     } else {
-      if (num_activity_events_ > options_.max_activity_api_events) {
-        OnEventsDropped("total device(activity) events reaches max", 1);
-        return;
-      }
       num_activity_events_++;
     }
     per_device_collector_[event.device_id].AddEvent(std::move(event));
@@ -525,15 +547,28 @@ class CuptiTraceCollectorImpl : public CuptiTraceCollector {
     activity_buffers_ = std::move(activity_buffers);
   }
 
+  void OnTracerCollectedCallbackData(
+      AnnotationMap annotation_map,
+      std::list<std::shared_ptr<CallbackAnnotationsAndEvents>> callback_events)
+      override {
+    *this->annotation_map() = std::move(annotation_map);
+    callback_events_ = std::move(callback_events);
+  }
+
   void Flush() override {}
   // Returns true if some GPU events are captured.
   bool Export(XSpace* space, uint64_t end_gpu_ns) override {
+    CuptiTraceCollector::OnTracerCollectedCallbackData(
+        std::move(*annotation_map()), std::move(callback_events_));
     CuptiTraceCollector::OnTracerCachedActivityBuffers(
         std::move(activity_buffers_));
 
     LOG(INFO) << " GpuTracer has collected " << num_callback_events_
               << " callback api events and " << num_activity_events_
               << " activity events. " << ReportDroppedEvents();
+    LOG(INFO) << " GpuTracer max callback_events: "
+              << options_.max_activity_api_events
+              << ", max activity events: " << options_.max_activity_api_events;
     size_t num_events = 0;
     XPlaneBuilder host_plane(
         FindOrAddMutablePlaneWithName(space, kCuptiDriverApiPlaneName));
@@ -571,15 +606,16 @@ class CuptiTraceCollectorImpl : public CuptiTraceCollector {
     if (events_dropped.empty()) return "";
     return absl::StrCat("Detected GPU events dropped on ",
                         tsl::port::Hostname(), ": Profiler has collected ",
-                        num_callback_events_.load(), " driver events and ",
-                        num_activity_events_.load(), " device events.",
+                        num_callback_events_, " driver events and ",
+                        num_activity_events_, " device events.",
                         events_dropped);
   }
 
  private:
-  std::atomic<int> num_callback_events_;
-  std::atomic<int> num_activity_events_;
+  size_t num_callback_events_ = 0;
+  size_t num_activity_events_ = 0;
   std::unique_ptr<CuptiActivityBufferManager> activity_buffers_;
+  std::list<std::shared_ptr<CallbackAnnotationsAndEvents>> callback_events_;
   absl::Mutex mutex_;
   absl::flat_hash_map<std::string, uint64_t> dropped_events_
       ABSL_GUARDED_BY(mutex_);
