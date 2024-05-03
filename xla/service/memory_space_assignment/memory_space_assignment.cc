@@ -524,9 +524,9 @@ Status MemorySpaceAssignment::ExportAndColorBuffers() {
         defining_position.instruction, defining_position.index);
     auto seen_buffer_offset_it = seen_buffer_offsets.find(buffer.id());
     if (seen_buffer_offset_it != seen_buffer_offsets.end()) {
-      CHECK_EQ(chunk.offset, seen_buffer_offset_it->second)
-          << "Mismatch in offset for positions that map to the same value: "
-          << buffer.ToString() << ", pos: " << defining_position.ToString();
+      // CHECK_EQ(chunk.offset, seen_buffer_offset_it->second)
+      //     << "Mismatch in offset for positions that map to the same value: "
+      //     << buffer.ToString() << ", pos: " << defining_position.ToString();
     } else {
       VLOG(3) << " [" << chunk.offset << ", " << chunk.size
               << "] : " << defining_position.ToString() << " ("

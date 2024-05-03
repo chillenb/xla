@@ -645,6 +645,237 @@ TEST_P(MemorySpaceAssignmentTest, NegateChain) {
   EXPECT_THAT(sequence.instructions()[10], op::CopyDone());
 }
 
+TEST_P(MemorySpaceAssignmentTest, DuplicateCopyTest) {
+  absl::string_view hlo_string = R"(
+HloModule module, is_scheduled=true
+
+ENTRY entry {
+  p0 = f32[2,3]{1,0} parameter(0)
+  p1 = f32[2,3]{1,0} parameter(1)
+  negate0 = f32[2,3]{1,0} negate(p1)
+  negate1 = f32[2,3]{1,0} negate(negate0)
+  negate2 = f32[2,3]{1,0} negate(negate1)
+  negate3 = f32[2,3]{1,0} negate(negate2)
+  negate4 = f32[2,3]{1,0} negate(negate3)
+  negate5 = f32[2,3]{1,0} negate(negate4)
+  negate6 = f32[2,3]{1,0} negate(negate5)
+  negate7 = f32[2,3]{1,0} negate(negate6)
+  p0_copy = f32[2,3]{1,0} copy(p0)
+  ROOT add0 = f32[2,3]{1,0} add(p0_copy, negate7)
+  }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  AssignMemorySpace(module.get());
+  const HloInstructionSequence& sequence =
+      module->schedule().sequence(module->entry_computation());
+  for (int i = 0; i < sequence.instructions().size(); ++i) {
+    VLOG(3) << "Instruction " << i << ": "
+            << sequence.instructions()[i]->ToString();
+  }
+}
+
+TEST_P(MemorySpaceAssignmentTest, DuplicateCopyBugTest) {
+  absl::string_view hlo_string = R"(
+HloModule jit_func, is_scheduled=true, entry_computation_layout={()->(f32[3]{0:T(128)}, s32[3]{0:T(128)}, f32[3]{0:T(128)}, s32[3]{0:T(128)})}, allow_spmd_sharding_propagation_to_output={true,true,true,true}
+
+%top_k_gt_f32_comparator.5 (Arg_0.6: f32[], Arg_1.7: f32[], Arg_2.8: s32[], Arg_3.9: s32[]) -> pred[] {
+  %Arg_3.9 = s32[]{:T(128)} parameter(3)
+  %Arg_2.8 = s32[]{:T(128)} parameter(2)
+  %Arg_1.7 = f32[]{:T(128)} parameter(1)
+  %Arg_0.6 = f32[]{:T(128)} parameter(0)
+  ROOT %compare.10 = pred[]{:T(512)} compare(f32[]{:T(128)} %Arg_0.6, f32[]{:T(128)} %Arg_1.7), direction=GT
+}
+
+ENTRY %main.35 () -> (f32[3], s32[3], f32[3], s32[3]) {
+  %constant.3 = f32[7]{0:T(128)} constant({3, 1, 4, 2, 5, 6, 7})
+  %iota.4 = s32[7]{0:T(128)} iota(), iota_dimension=0
+  %sort.11 = (f32[7]{0:T(128)}, s32[7]{0:T(128)}) sort(f32[7]{0:T(128)} %constant.3, s32[7]{0:T(128)} %iota.4), dimensions={0}, to_apply=%top_k_gt_f32_comparator.5
+  %get-tuple-element.14 = s32[7]{0:T(128)} get-tuple-element((f32[7]{0:T(128)}, s32[7]{0:T(128)}) %sort.11), index=1
+  %get-tuple-element.12 = f32[7]{0:T(128)} get-tuple-element((f32[7]{0:T(128)}, s32[7]{0:T(128)}) %sort.11), index=0
+  %bitcast = f32[3]{0:T(128)} bitcast(f32[7]{0:T(128)} %get-tuple-element.12)
+  %bitcast.1 = s32[3]{0:T(128)} bitcast(s32[7]{0:T(128)} %get-tuple-element.14)
+  %tuple = (f32[3]{0:T(128)}, s32[3]{0:T(128)}, f32[3]{0:T(128)}, s32[3]{0:T(128)}) tuple(f32[3]{0:T(128)} %bitcast, s32[3]{0:T(128)} %bitcast.1, f32[3]{0:T(128)} %bitcast, s32[3]{0:T(128)} %bitcast.1)
+  %get-tuple-element.4 = f32[3]{0:T(128)} get-tuple-element((f32[3]{0:T(128)}, s32[3]{0:T(128)}, f32[3]{0:T(128)}, s32[3]{0:T(128)}) %tuple), index=0
+  %get-tuple-element.5 = s32[3]{0:T(128)} get-tuple-element((f32[3]{0:T(128)}, s32[3]{0:T(128)}, f32[3]{0:T(128)}, s32[3]{0:T(128)}) %tuple), index=1
+  %get-tuple-element.6 = f32[3]{0:T(128)} get-tuple-element((f32[3]{0:T(128)}, s32[3]{0:T(128)}, f32[3]{0:T(128)}, s32[3]{0:T(128)}) %tuple), index=2
+  %get-tuple-element.7 = s32[3]{0:T(128)} get-tuple-element((f32[3]{0:T(128)}, s32[3]{0:T(128)}, f32[3]{0:T(128)}, s32[3]{0:T(128)}) %tuple), index=3
+  %copy.2 = f32[3]{0:T(128)} copy(f32[3]{0:T(128)} %get-tuple-element.6)
+  %copy.3 = s32[3]{0:T(128)} copy(s32[3]{0:T(128)} %get-tuple-element.7)
+  ROOT %tuple.1 = (f32[3]{0:T(128)}, s32[3]{0:T(128)}, f32[3]{0:T(128)}, s32[3]{0:T(128)}) tuple(f32[3]{0:T(128)} %get-tuple-element.4, s32[3]{0:T(128)} %get-tuple-element.5, f32[3]{0:T(128)} %copy.2, s32[3]{0:T(128)} %copy.3)
+}
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  AssignMemorySpace(module.get());
+  const HloInstructionSequence& sequence =
+      module->schedule().sequence(module->entry_computation());
+  for (int i = 0; i < sequence.instructions().size(); ++i) {
+    VLOG(3) << "Instruction " << i << ": "
+            << sequence.instructions()[i]->ToString();
+  }
+}
+
+TEST_P(MemorySpaceAssignmentTest, DuplicateCopySingleWhileTest) {
+  absl::string_view hlo_string = R"(
+HloModule WhileAllocationBug, is_scheduled=true
+
+%WhileBodyA {
+  %increment_constant = f32[] constant(1)
+  %body_param = (f32[2,3]{1,0}, f32[]) parameter(0)
+  %get-tuple-element.1 = f32[] get-tuple-element((f32[2,3]{1,0}, f32[]) %body_param), index=1
+  %incremented_counter = f32[] add(f32[] %get-tuple-element.1, f32[] %increment_constant)
+  %get-tuple-element.2 = f32[2,3]{1,0} get-tuple-element((f32[2,3]{1,0}, f32[]) %body_param), index=0
+  %loop_neg = f32[2,3]{1,0} negate(f32[2,3]{1,0} %get-tuple-element.2)
+  ROOT %tuple = (f32[2,3]{1,0}, f32[]) tuple(f32[2,3]{1,0} %loop_neg, f32[] %incremented_counter)
+  }
+
+%WhileCondA {
+  %loop_threshold = f32[] constant(50)
+  %cond_param = (f32[2,3]{1,0}, f32[]) parameter(0)
+  %counter_value = f32[] get-tuple-element((f32[2,3]{1,0}, f32[]) %cond_param), index=1
+  ROOT %compare = pred[] compare(f32[] %counter_value, f32[] %loop_threshold), direction=LT
+  }
+
+ENTRY %Entry {
+  %data_a = f32[2,3]{1,0} parameter(0)
+  %counter_a = f32[] parameter(1)
+  %negate0 = f32[2,3]{1,0} negate(f32[2,3]{1,0} %data_a)
+  %negate1 = f32[2,3]{1,0} negate(f32[2,3]{1,0} %negate0)
+  %negate2 = f32[2,3]{1,0} negate(f32[2,3]{1,0} %negate1)
+  %negate3 = f32[2,3]{1,0} negate(f32[2,3]{1,0} %negate2)
+  %negate4 = f32[2,3]{1,0} negate(f32[2,3]{1,0} %negate3)
+  %data_a_copy = f32[2,3]{1,0} copy(f32[2,3]{1,0} %data_a)
+  %input_a = (f32[2,3]{1,0}, f32[]) tuple(f32[2,3]{1,0} %data_a_copy, f32[] %counter_a)
+  %while_a = (f32[2,3]{1,0}, f32[]) while((f32[2,3]{1,0}, f32[]) %input_a), condition=%WhileCondA, body=%WhileBodyA
+  %get-tuple-element.3 = f32[2,3]{1,0} get-tuple-element((f32[2,3]{1,0}, f32[]) %while_a), index=0
+  ROOT %tuple.1 = tuple(f32[2,3]{1,0} %get-tuple-element.3, f32[2,3]{1,0} %negate4)
+  }
+  )";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  AssignMemorySpace(module.get());
+  for (const auto& computation : module->computations()) {
+    const HloInstructionSequence& sequence =
+        module->schedule().sequence(computation);
+    for (int i = 0; i < sequence.instructions().size(); ++i) {
+      VLOG(3) << i << ": " << sequence.instructions()[i]->ToString() << "\n";
+    }
+  }
+}
+
+TEST_P(MemorySpaceAssignmentTest, DuplicateCopySingleWhileFailureHandlingTest) {
+  absl::string_view hlo_string = R"(
+HloModule WhileAllocationBug, is_scheduled=true
+
+%WhileBodyA {
+  %increment_constant = f32[] constant(1)
+  %body_param = (f32[4,6]{1,0}, f32[]) parameter(0)
+  %get-tuple-element.1 = f32[] get-tuple-element((f32[4,6]{1,0}, f32[]) %body_param), index=1
+  %incremented_counter = f32[] add(f32[] %get-tuple-element.1, f32[] %increment_constant)
+  %get-tuple-element.2 = f32[4,6]{1,0} get-tuple-element((f32[4,6]{1,0}, f32[]) %body_param), index=0
+  %loop_neg = f32[4,6]{1,0} negate(f32[4,6]{1,0} %get-tuple-element.2)
+  ROOT %tuple = (f32[4,6]{1,0}, f32[]) tuple(f32[4,6]{1,0} %loop_neg, f32[] %incremented_counter)
+  }
+
+%WhileCondA {
+  %loop_threshold = f32[] constant(50)
+  %cond_param = (f32[4,6]{1,0}, f32[]) parameter(0)
+  %counter_value = f32[] get-tuple-element((f32[4,6]{1,0}, f32[]) %cond_param), index=1
+  ROOT %compare = pred[] compare(f32[] %counter_value, f32[] %loop_threshold), direction=LT
+  }
+
+ENTRY %Entry {
+  %data_a = f32[4,6]{1,0} parameter(0)
+  %counter_a = f32[] parameter(1)
+  %negate0 = f32[4,6]{1,0} negate(f32[4,6]{1,0} %data_a)
+  %negate1 = f32[4,6]{1,0} negate(f32[4,6]{1,0} %negate0)
+  %negate2 = f32[4,6]{1,0} negate(f32[4,6]{1,0} %negate1)
+  %negate3 = f32[4,6]{1,0} negate(f32[4,6]{1,0} %negate2)
+  %negate4 = f32[4,6]{1,0} negate(f32[4,6]{1,0} %negate3)
+  %data_a_copy = f32[4,6]{1,0} copy(f32[4,6]{1,0} %data_a)
+  %input_a = (f32[4,6]{1,0}, f32[]) tuple(f32[4,6]{1,0} %data_a_copy, f32[] %counter_a)
+  %while_a = (f32[4,6]{1,0}, f32[]) while((f32[4,6]{1,0}, f32[]) %input_a), condition=%WhileCondA, body=%WhileBodyA
+  %get-tuple-element.3 = f32[4,6]{1,0} get-tuple-element((f32[4,6]{1,0}, f32[]) %while_a), index=0
+  ROOT %tuple.1 = tuple(f32[4,6]{1,0} %get-tuple-element.3, f32[4,6]{1,0} %negate4)
+  }
+  )";
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  AssignMemorySpace(module.get());
+  for (const auto& computation : module->computations()) {
+    const HloInstructionSequence& sequence =
+        module->schedule().sequence(computation);
+    for (int i = 0; i < sequence.instructions().size(); ++i) {
+      VLOG(3) << i << ": " << sequence.instructions()[i]->ToString() << "\n";
+    }
+  }
+}
+
+TEST_P(MemorySpaceAssignmentTest, DuplicateCopyDoubleWhileTest) {
+  absl::string_view hlo_string = R"(
+  HloModule WhileAllocationBug, is_scheduled=true
+
+  %WhileBodyA (body_param: (f32[2,1], f32[])) -> (f32[2,1], f32[]) {
+    %increment_constant = f32[] constant(1)
+    %body_param = (f32[2,1]{1,0}, f32[]) parameter(0)
+    %get-tuple-element.1 = f32[] get-tuple-element((f32[2,1]{1,0}, f32[]) %body_param), index=1
+    %incremented_counter = f32[] add(f32[] %get-tuple-element.1, f32[] %increment_constant)
+    %get-tuple-element.2 = f32[2,1]{1,0} get-tuple-element((f32[2,1]{1,0}, f32[]) %body_param), index=0
+    %neg = f32[2,1]{1,0} negate(f32[2,1]{1,0} %get-tuple-element.2)
+    ROOT %tuple = (f32[2,1]{1,0}, f32[]) tuple(f32[2,1]{1,0} %neg, f32[] %incremented_counter)
+  }
+
+  %WhileCondA (cond_param: (f32[2,1], f32[])) -> pred[] {
+    %loop_threshold = f32[] constant(50)
+    %cond_param = (f32[2,1]{1,0}, f32[]) parameter(0)
+    %counter_value = f32[] get-tuple-element((f32[2,1]{1,0}, f32[]) %cond_param), index=1
+    ROOT %compare = pred[] compare(f32[] %counter_value, f32[] %loop_threshold), direction=LT
+  }
+
+  %WhileBodyB (body_param: (f32[2,1], f32[])) -> (f32[2,1], f32[]) {
+    %increment_constant = f32[] constant(1)
+    %body_param = (f32[2,1]{1,0}, f32[]) parameter(0)
+    %get-tuple-element.1 = f32[] get-tuple-element((f32[2,1]{1,0}, f32[]) %body_param), index=1
+    %incremented_counter = f32[] add(f32[] %get-tuple-element.1, f32[] %increment_constant)
+    %get-tuple-element.2 = f32[2,1]{1,0} get-tuple-element((f32[2,1]{1,0}, f32[]) %body_param), index=0
+    %neg = f32[2,1]{1,0} negate(f32[2,1]{1,0} %get-tuple-element.2)
+    ROOT %tuple = (f32[2,1]{1,0}, f32[]) tuple(f32[2,1]{1,0} %neg, f32[] %incremented_counter)
+  }
+
+  %WhileCondB (cond_param: (f32[2,1], f32[])) -> pred[] {
+    %loop_threshold = f32[] constant(50)
+    %cond_param = (f32[2,1]{1,0}, f32[]) parameter(0)
+    %counter_value = f32[] get-tuple-element((f32[2,1]{1,0}, f32[]) %cond_param), index=1
+    ROOT %compare = pred[] compare(f32[] %counter_value, f32[] %loop_threshold), direction=LT
+  }
+
+  ENTRY %Entry (param_iter: f32[2,1], param_data: f32[], p2: f32[2,1]) -> (f32[2,1], f32[2,1]) {
+    %data_a = f32[2,1]{1,0} parameter(0)
+    %counter_a = f32[] parameter(1)
+    %counter_b = f32[] parameter(2)
+    %data_b = f32[2,1]{1,0} copy(f32[2,1]{1,0} %data_a)
+    %input_a = (f32[2,1]{1,0}, f32[]) tuple(f32[2,1]{1,0} %data_a, f32[] %counter_a)
+    %while_a = (f32[2,1]{1,0}, f32[]) while((f32[2,1]{1,0}, f32[]) %input_a), condition=%WhileCondA, body=%WhileBodyA
+    %input_b = (f32[2,1]{1,0}, f32[]) tuple(f32[2,1]{1,0} %data_b, f32[] %counter_b)
+    %while_b = (f32[2,1]{1,0}, f32[]) while((f32[2,1]{1,0}, f32[]) %input_b), condition=%WhileCondB, body=%WhileBodyB
+    %output_a = f32[2,1]{1,0} get-tuple-element((f32[2,1]{1,0}, f32[]) %while_a), index=0
+    %output_b = f32[2,1]{1,0} get-tuple-element((f32[2,1]{1,0}, f32[]) %while_b), index=0
+    ROOT %output = (f32[2,1]{1,0}, f32[2,1]{1,0}) tuple(f32[2,1]{1,0} %output_a, f32[2,1]{1,0} %output_b)
+  }
+  )";
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                          ParseAndReturnVerifiedModule(hlo_string));
+  AssignMemorySpace(module.get());
+  const HloInstructionSequence& sequence =
+      module->schedule().sequence(module->entry_computation());
+  for (int i = 0; i < sequence.instructions().size(); ++i) {
+    std::cout << i << ": " << sequence.instructions()[i]->ToString() << "\n";
+  }
+}
+
 TEST_P(MemorySpaceAssignmentTest, AlwaysSpillJitPrefetchTest) {
   // The negate chain is long enough for asynchronous copy to be inserted
   // between p1 and add.
@@ -2996,7 +3227,7 @@ TEST_P(MemorySpaceAssignmentTest, ConditionalMultiUse) {
   TF_ASSERT_OK_AND_ASSIGN(auto module,
                           ParseAndReturnVerifiedModule(hlo_string));
   AssignMemorySpace(module.get());
-
+  std::cout << module.get()->ToString() << "\n";
   if (allocate_across_sequential_calls()) {
     // Make sure the copy1->add edge is in alternate memory. Before conditional,
     // this should be evicted to default memory and neg uses the input from

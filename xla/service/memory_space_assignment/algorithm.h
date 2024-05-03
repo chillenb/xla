@@ -30,6 +30,8 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "xla/hlo/ir/hlo_opcode.h"
+
 // TODO(b/210891274): Use btree_map after build issue in Windows is resolved.
 #if defined(__GNUC__) || defined(__clang__)
 #include "absl/container/btree_map.h"
@@ -60,7 +62,9 @@ limitations under the License.
 
 namespace xla {
 namespace memory_space_assignment {
-
+const bool MSA_ENABLE_SYNC_COPY_REPLACEMENT = true;
+const bool MSA_COPY_REPLACEMENT_IGNORE_WHILE_COND_FUSION_TRIVIAL_DUS = true;
+const bool MSA_COPY_REPLACEMENT_IGNORE_NESTED_COPY_USES = true;
 // AllocationValue is used to break up HloValues for each non-trivial position
 // (trivial positions are considered Tuple, GetTupleElement, and Bitcast). An
 // HloValue may include positions and uses that alias with each other across
@@ -140,6 +144,14 @@ class AllocationValue {
     // All the positions where this use aliases with. The aliased positions
     // must get the same allocation.
     std::vector<HloPosition> aliases;
+    // If the hlo_use points to a copy instruction, copy_destination is the
+    // allocation value that is defined at the output of copy instruction
+    std::vector<AllocationValue*> copy_destinations;
+    // If the use is copying from an allocation value produced by a sync copy,
+    // we keep a pointer to the use that defined the copy. This helps to make
+    // sure the alternative copy allocations are create right before the time
+    // of the original sync copy.
+    Use* copy_source = nullptr;
 
     bool operator==(const Use& other) const {
       return hlo_use == other.hlo_use && time == other.time &&
@@ -153,10 +165,12 @@ class AllocationValue {
   };
 
   AllocationValue(const HloValue* value, const HloPosition& position,
-                  int64_t size)
+                  int64_t size,
+                  const MsaBufferInterval* buffer_interval = nullptr)
       : value_(value),
         defining_position_(position),
         size_(size),
+        buffer_interval_(buffer_interval),
         requires_contiguous_allocation_(false) {}
 
   const HloPosition& defining_position() const { return defining_position_; }
@@ -170,6 +184,7 @@ class AllocationValue {
   const HloComputation* computation() const {
     return defining_instruction()->parent();
   }
+  const MsaBufferInterval* buffer_interval() const { return buffer_interval_; }
   AllocationSequence* mutable_allocation_sequence() {
     return &allocation_sequence_;
   }
@@ -197,6 +212,7 @@ class AllocationValue {
   const HloValue* value_;
   HloPosition defining_position_;
   int64_t size_;
+  const MsaBufferInterval* buffer_interval_;
   // If true, there must be a contiguous allocation for this buffer without
   // any copies.
   bool requires_contiguous_allocation_;
@@ -452,10 +468,12 @@ class MsaAlgorithm : public GlobalDecreasingSizeBestFitHeap<HloValue> {
     int64_t inclusive_start_time;
     int64_t end_time;
     int64_t latest_prefetch_time;
+    int64_t required_copy_allocation_latest_time;
     int64_t size;
     bool prefer_no_copy_alternate_mem_allocation;
     bool allow_no_copy_alternate_mem_allocation;
     bool require_no_copy_alternate_mem_allocation;
+    bool require_copy_allocation;
     bool allow_prefetch;
     std::optional<int64_t> earliest_prefetch_time;
     std::optional<int64_t> preferred_prefetch_time;
@@ -652,7 +670,9 @@ class MsaAlgorithm : public GlobalDecreasingSizeBestFitHeap<HloValue> {
     // which case, we fallback to an unsliced solution.
     kAllSlicesHaveTheSameStartTime = 128,
     // There were conflicting preferred offsets.
-    kFailConflictingPreferredOffsets = 256
+    kFailConflictingPreferredOffsets = 256,
+    // Could not replace the synchronous copy with an asynchronous one
+    kFailSyncCopyReplacement = 512
   };
 
   // Return true if the result belongs to a failure.
@@ -710,6 +730,11 @@ class MsaAlgorithm : public GlobalDecreasingSizeBestFitHeap<HloValue> {
   static Allocation* GetLiveAllocationAt(const AllocationSequence& allocations,
                                          int64_t time);
 
+  const HloValue* GetHloValueConsumedByUse(
+      const AllocationValue::Use& use) const;
+
+  const HloValue* GetHloValueConsumedByUse(const HloUse& hlo_use) const;
+
   // Returns true if the use is allowed in the alternate memory.
   bool IsUseAllowedInAlternateMemory(const AllocationValue& value,
                                      const HloUse& use) const;
@@ -755,6 +780,39 @@ class MsaAlgorithm : public GlobalDecreasingSizeBestFitHeap<HloValue> {
       int64_t definition_time, bool require_no_copy_alternate_mem_allocation,
       const std::vector<int64_t>& all_use_times);
 
+  bool IsNonLayoutChangingSyncCopy(const HloInstruction* instruction) const;
+
+  bool HasWhileOrConditionalOrFusionOrTupleUse(
+      const AllocationValue* allocation_value) const;
+
+  bool IsWhileOrConditionalOrFusionOrTrivialOrDusInstruction(
+      const HloInstruction* instruction) const;
+
+  bool IsDefinedByWhileOrConditionalOrFusionOrTrivialOrDus(
+      const MsaBufferInterval* interval) const {
+    auto opcode = interval->buffer->defining_instruction()->opcode();
+    return opcode == HloOpcode::kWhile || opcode == HloOpcode::kConditional ||
+           opcode == HloOpcode::kFusion || opcode == HloOpcode::kTuple ||
+           opcode == HloOpcode::kTuple ||
+           opcode == HloOpcode::kGetTupleElement ||
+           opcode == HloOpcode::kDynamicUpdateSlice;
+  }
+
+  bool HasCopyUse(const AllocationValue* allocation_value) const;
+
+  void UpdateCollocatedIntervalsAndAllocationValues(
+      const std::vector<BufferInterval>& sorted_buffer_intervals);
+
+  std::vector<const BufferInterval*>& IntervalToColocatedIntervals(
+      const BufferInterval* interval) {
+    return interval_to_colocated_intervals_.at(interval);
+  }
+
+  std::vector<AllocationValue>& IntervalToAllocationValues(
+      const BufferInterval* interval) {
+    return interval_to_allocation_values_.at(interval);
+  }
+
   // Finds allocations for allocation values generated from colocated intervals.
   // All of the allocation values have a must-alias relationship with each
   // other. Returns either kSuccess if all of the sites could be placed in the
@@ -780,7 +838,7 @@ class MsaAlgorithm : public GlobalDecreasingSizeBestFitHeap<HloValue> {
   // Result::kSuccess if the buffer could be placed in alternate memory or some
   // other Result with an OR of reasons why the buffer couldn't be placed in
   // alternate memory.
-  Result AllocateSegment(const AllocationRequest& request);
+  Result AllocateSegment(AllocationRequest& request);
 
   // Try allocating in alternate memory without any copies.
   Result AllocateInAlternateMemoryNoCopy(const AllocationRequest& request);
@@ -858,7 +916,8 @@ class MsaAlgorithm : public GlobalDecreasingSizeBestFitHeap<HloValue> {
   // Propagates aliased required assignment for a given position.
   void AddAliasedRequiredAssignment(const HloInstruction* instruction,
                                     ShapeIndex index,
-                                    const Allocation* aliased_allocation);
+                                    const Allocation* aliased_allocation,
+                                    const HloValue* value = nullptr);
 
   // This sets a required assignment. CHECK fails if there is a conflicting
   // required assignment at the same time.
@@ -870,14 +929,17 @@ class MsaAlgorithm : public GlobalDecreasingSizeBestFitHeap<HloValue> {
   void AddRequiredAssignment(const HloInstruction* instruction,
                              ShapeIndex index, MemorySpace memory_space,
                              AliasedOffset* offset = nullptr,
-                             bool add_to_pending = true);
+                             bool add_to_pending = true,
+                             const HloValue* value = nullptr);
   void AddRequiredAssignment(const HloPosition& position,
                              MemorySpace memory_space,
                              AliasedOffset* offset = nullptr,
-                             bool add_to_pending = true);
+                             bool add_to_pending = true,
+                             const HloValue* value = nullptr);
   void AddRequiredAssignment(const HloUse& use, MemorySpace memory_space,
                              AliasedOffset* offset = nullptr,
-                             bool add_to_pending = true);
+                             bool add_to_pending = true,
+                             const HloValue* value = nullptr);
 
   // Adds input and outputs as required assignments.
   void AddInputAndOutputRequiredAssignments();
@@ -1096,6 +1158,13 @@ class MsaAlgorithm : public GlobalDecreasingSizeBestFitHeap<HloValue> {
   // alternate memory.
   absl::flat_hash_map<const HloInstruction*, absl::flat_hash_set<ShapeIndex>>
       outputs_in_alternate_memory_map_;
+  absl::flat_hash_map<const BufferInterval*, std::vector<const BufferInterval*>>
+      interval_to_colocated_intervals_;
+  absl::flat_hash_map<const BufferInterval*, std::vector<AllocationValue>>
+      interval_to_allocation_values_;
+  absl::flat_hash_map<const HloInstruction*, std::vector<AllocationValue*>>
+      instruction_to_allocation_values_;
+
   // Debug strings.
   std::string buffer_info_str_;
   std::string allocation_info_str_;

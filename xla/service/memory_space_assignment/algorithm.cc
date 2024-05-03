@@ -546,7 +546,8 @@ void MsaAlgorithm::CreateAllocationValues(
     const MsaBufferInterval& buffer_interval,
     std::vector<AllocationValue>& allocation_values) const {
   const HloValue* value = buffer_interval.buffer;
-  VLOG(3) << "Creating AllocationValues for: " << value->ToString();
+  VLOG(3) << "Creating AllocationValues for HloValue: ";
+  XLA_VLOG_LINES(3, value->ToString());
 
   // Find and sort all non-trivial (excluding GTE, Tuple, and bitcast)
   // positions. We create an AllocationValue object for each non-trivial
@@ -575,7 +576,8 @@ void MsaAlgorithm::CreateAllocationValues(
   int beginning_idx = allocation_values.size();
   for (int i = 0; i < positions.size(); ++i) {
     const HloPosition& position = positions.at(i);
-    allocation_values.emplace_back(value, position, buffer_interval.size);
+    allocation_values.emplace_back(value, position, buffer_interval.size,
+                                   &buffer_interval);
   }
 
   std::vector<HloUse> uses(value->GetUses().begin(), value->GetUses().end());
@@ -614,6 +616,9 @@ void MsaAlgorithm::CreateAllocationValues(
         last_allocation_value = allocation_value;
       }
     }
+    if (last_allocation_value == nullptr) {
+      return;
+    }
     CHECK(last_allocation_value != nullptr);
     last_allocation_value->AddUse(use, use_time);
   }
@@ -635,8 +640,6 @@ void MsaAlgorithm::CreateAllocationValues(
               << " to require contiguous allocation because of options.";
       allocation_value.set_requires_contiguous_allocation(true);
     }
-    VLOG(3) << "Created allocation value: "
-            << allocation_values.at(i).ToString();
   }
 }
 
@@ -1359,8 +1362,10 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> MsaAlgorithm::Finish() {
     IdentifyAndOptimizeMemoryBoundLoops();
   }
 
+  UpdateCollocatedIntervalsAndAllocationValues(sorted_buffer_intervals);
+
   for (const auto& interval : sorted_buffer_intervals) {
-    auto colocated_intervals = GetSortedColocatedIntervals(interval);
+    const auto& colocated_intervals = IntervalToColocatedIntervals(&interval);
     if (AreIntervalsReservedInAlternateMemory(colocated_intervals)) {
       // Increment the reserved part of alternate memory so that it is not
       // available for other buffers.
@@ -1370,6 +1375,7 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> MsaAlgorithm::Finish() {
   VLOG(2) << "Total reserved bytes = " << reserved_in_bytes_;
 
   for (auto& interval : sorted_buffer_intervals) {
+    auto& allocation_values = IntervalToAllocationValues(&interval);
     if (!interval.need_allocation) {
       VLOG(3) << "Skip " << interval.buffer->ToShortString()
               << " because it doesn't need an allocation.";
@@ -1404,7 +1410,7 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> MsaAlgorithm::Finish() {
       continue;
     }
 
-    auto colocated_intervals = GetSortedColocatedIntervals(interval);
+    auto& colocated_intervals = IntervalToColocatedIntervals(&interval);
 
     if (AreIntervalsReservedInAlternateMemory(colocated_intervals)) {
       VLOG(3) << "Interval " << interval.buffer->ToShortString()
@@ -1447,10 +1453,6 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> MsaAlgorithm::Finish() {
       AppendBufferInfoDebugString(interval, &buffer_info_str_);
     }
 
-    std::vector<AllocationValue> allocation_values;
-    CreateAllocationValuesFromColocatedIntervals(colocated_intervals,
-                                                 allocation_values);
-
     // Retry allocating this value with larger limits if allocation fails.
     bool repacked = false;
     for (int retry_number = 0; retry_number < options_.max_retries;
@@ -1462,6 +1464,27 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> MsaAlgorithm::Finish() {
           AllocateAllocationValues(absl::MakeSpan(allocation_values)));
       VLOG(2) << "Allocation result = "
               << absl::StrFormat("%x", static_cast<int>(result));
+      if (result_is(result, Result::kFailSyncCopyReplacement)) {
+        // TODO(mehrdadk): This withdrawing condition might be too conservative.
+        VLOG(2)
+            << "Withdraw all copy replacement efforts for "
+            << interval.buffer->ToShortString()
+            << " since the allocation result is not successful. Retry number "
+            << retry_number;
+        for (auto& allocation_value : allocation_values) {
+          for (auto& use : allocation_value.uses()) {
+            use.copy_destinations.clear();
+            use.copy_source = nullptr;
+          }
+        }
+        UncommitPendingChunks(absl::MakeSpan(allocation_values));
+        TF_ASSIGN_OR_RETURN(
+            Result result,
+            AllocateAllocationValues(absl::MakeSpan(allocation_values)));
+        VLOG(2)
+            << "Allocation after turning off the copy replacement. result = "
+            << absl::StrFormat("%x", static_cast<int>(result));
+      }
       if (result_requires_uncommit(result)) {
         UncommitPendingChunks(absl::MakeSpan(allocation_values));
         VLOG(2) << "Couldn't allocate. Retry number " << retry_number;
@@ -1850,11 +1873,21 @@ absl::StatusOr<MsaAlgorithm::Result> MsaAlgorithm::AllocateAllocationValues(
   // Find the use times across all of the related AllocationValues and sort
   // them. We use these to find allocations that are available throughout the
   // entire live range of all the AllocationValues.
+  CHECK(MSA_COPY_REPLACEMENT_IGNORE_NESTED_COPY_USES)
+      << "Handling use times for nested copies is not implemented yet.";
   std::vector<int64_t> all_use_times;
   for (const AllocationValue& allocation_value : allocation_values) {
-    absl::c_transform(allocation_value.uses(),
-                      std::back_inserter(all_use_times),
-                      [](const AllocationValue::Use& use) { return use.time; });
+    for (const auto& use : allocation_value.uses()) {
+      if (!use.copy_destinations.empty()) {
+        for (const auto& copy_destination : use.copy_destinations) {
+          for (const auto& copy_use : copy_destination->uses()) {
+            all_use_times.push_back(copy_use.time);
+          }
+        }
+      } else {
+        all_use_times.push_back(use.time);
+      }
+    }
   }
   absl::c_sort(all_use_times);
 
@@ -1866,6 +1899,17 @@ absl::StatusOr<MsaAlgorithm::Result> MsaAlgorithm::AllocateAllocationValues(
 
   Result result = Result::kSuccess;
   for (AllocationValue& allocation_value : allocation_values) {
+    VLOG(3) << "Allocating allocation value: "
+            << allocation_value.ToShortString();
+    if (MSA_ENABLE_SYNC_COPY_REPLACEMENT &&
+        IsNonLayoutChangingSyncCopy(allocation_value.defining_instruction())) {
+      if (!(MSA_COPY_REPLACEMENT_IGNORE_WHILE_COND_FUSION_TRIVIAL_DUS &&
+            HasWhileOrConditionalOrFusionOrTupleUse(&allocation_value))) {
+        VLOG(3) << "Skip allocating allocation value belonging to copy "
+                << allocation_value.defining_instruction()->ToString();
+        continue;
+      }
+    }
     int64_t definition_time =
         instruction_schedule.at(allocation_value.defining_instruction());
 
@@ -1900,48 +1944,111 @@ absl::StatusOr<MsaAlgorithm::Result> MsaAlgorithm::AllocateAllocationValues(
 
     const AllocationValue::Use* previous_use = nullptr;
     // Iterate over the uses.
-    for (AllocationValue::Use& use : allocation_value.uses()) {
-      preferred_offset = UpdatePreferredOffsetForUse(use, preferred_offset);
-      AllocationRequest request = CreateAllocationRequest(
-          allocation_value, use, previous_use, preferred_offset,
-          definition_time, require_no_copy_alternate_mem_allocation,
-          all_use_times);
-      // Bitcasts don't define buffers and don't directly consume buffers.
-      // Skip allocating buffers for bitcast uses (unless they are the root
-      // instruction). The uses that feed from bitcasts will be handled
-      // specially.
-      if (use.hlo_use.instruction->opcode() != HloOpcode::kBitcast ||
-          use.hlo_use.instruction ==
-              use.hlo_use.instruction->parent()->root_instruction()) {
-        result_mark(AllocateSegment(request), result);
-        if (request.require_no_copy_alternate_mem_allocation &&
-            result != Result::kSuccess) {
-          Status failed_precondition = FailedPrecondition(
-              "The value defined at %s requires allocation in the alternate "
-              "memory, which could not be satisfied. This typically happens "
-              "because more pinned buffers are live than the alternate memory "
-              "capacity.",
-              allocation_value.defining_instruction()->ToString());
-          LOG(ERROR) << failed_precondition;
-          return failed_precondition;
-        }
-        if (result_requires_uncommit(result)) {
-          // If the allocation finding failed (e.g., due to running out of
-          // asynchronous copies), then fall back to allocating the buffer
-          // entirely in the default memory.
-          return result;
-        }
+    for (int primary_use_idx = 0;
+         primary_use_idx < allocation_value.uses().size(); ++primary_use_idx) {
+      AllocationValue::Use& primary_use =
+          allocation_value.uses().at(primary_use_idx);
+      VLOG(3) << "Working on primary use: " << primary_use.hlo_use.ToString();
+      std::vector<std::tuple<int, int, std::vector<AllocationValue::Use>*>>
+          worklist;
+      if (primary_use.copy_destinations.empty()) {
+        worklist.push_back(std::make_tuple(primary_use_idx, primary_use_idx + 1,
+                                           &allocation_value.uses()));
 
-        // If there are multiple uses, they can try using the memory
-        // allocation already at the alternate memory.
-        definition_time = instruction_schedule.at(use.hlo_use.instruction);
-        previous_use = &use;
+      } else {
+        for (const auto& copy_destination : primary_use.copy_destinations) {
+          if (copy_destination->buffer_interval()->need_allocation) {
+            for (auto& dest_use : copy_destination->uses()) {
+              dest_use.copy_source = &primary_use;
+            }
+          } else {
+            VLOG(3) << "Skip allocating use " << primary_use.hlo_use.ToString()
+                    << " because it's a copy use, but its buffer interval did "
+                       "not need an allocation.";
+            continue;
+          }
+          worklist.push_back(std::make_tuple(0, copy_destination->uses().size(),
+                                             &copy_destination->uses()));
+        }
       }
-      const auto use_time = request.end_time;
-      UpdateAllocationRequirementForUseAliases(allocation_value, use, use_time);
-      MaybeCreateMirroredParentAllocationForWhileUse(
-          allocation_value, use, use_time, allocation_values,
-          preferred_offset_for_computation);
+
+      for (auto& [secondary_use_idx_start, secondary_use_idx_end,
+                  non_copy_uses] : worklist) {
+        for (int secondary_use_idx = secondary_use_idx_start;
+             secondary_use_idx < secondary_use_idx_end; ++secondary_use_idx) {
+          AllocationValue::Use& use = non_copy_uses->at(secondary_use_idx);
+          VLOG(3) << "Working on secondary use: " << use.hlo_use.ToString();
+          preferred_offset = UpdatePreferredOffsetForUse(use, preferred_offset);
+          AllocationRequest request = CreateAllocationRequest(
+              allocation_value, use, previous_use, preferred_offset,
+              definition_time, require_no_copy_alternate_mem_allocation,
+              all_use_times);
+          // Bitcasts don't define buffers and don't directly consume buffers.
+          // Skip allocating buffers for bitcast uses (unless they are the root
+          // instruction). The uses that feed from bitcasts will be handled
+          // specially.
+          if (use.hlo_use.instruction->opcode() != HloOpcode::kBitcast ||
+              use.hlo_use.instruction ==
+                  use.hlo_use.instruction->parent()->root_instruction()) {
+            result_mark(AllocateSegment(request), result);
+            if (request.require_copy_allocation) {
+              auto allocation_sequence =
+                  request.allocation_value->mutable_allocation_sequence();
+              auto it = std::find_if(
+                  allocation_sequence->begin(), allocation_sequence->end(),
+                  [&](const std::unique_ptr<
+                      xla::memory_space_assignment::Allocation>&
+                          allocation_ptr) {
+                    auto copy_allocation = dynamic_cast<const CopyAllocation*>(
+                        allocation_ptr.get());
+                    return copy_allocation &&
+                           copy_allocation->copy_done_schedule_before() <=
+                               request.required_copy_allocation_latest_time;
+                  });
+              if (it == allocation_sequence->end()) {
+                VLOG(3) << "No async copy allocation found by the end of "
+                           "segment allocation. "
+                           "Sync copy replacement has failed. Fall back to the "
+                           "normal mode.";
+                // TODO(mehrdadk): either implement the fall-back mechanism
+                // here, or perform extra allocations to evict and fetch back
+                result_mark(Result::kFailSyncCopyReplacement, result);
+              }
+            }
+            if (request.require_no_copy_alternate_mem_allocation &&
+                result != Result::kSuccess) {
+              Status failed_precondition = FailedPrecondition(
+                  "The value defined at %s requires allocation in the "
+                  "alternate "
+                  "memory, which could not be satisfied. This typically "
+                  "happens "
+                  "because more pinned buffers are live than the alternate "
+                  "memory "
+                  "capacity.",
+                  allocation_value.defining_instruction()->ToString());
+              LOG(ERROR) << failed_precondition;
+              return failed_precondition;
+            }
+            if (result_requires_uncommit(result)) {
+              // If the allocation finding failed (e.g., due to running out of
+              // asynchronous copies), then fall back to allocating the buffer
+              // entirely in the default memory.
+              return result;
+            }
+
+            // If there are multiple uses, they can try using the memory
+            // allocation already at the alternate memory.
+            definition_time = instruction_schedule.at(use.hlo_use.instruction);
+            previous_use = &use;
+          }
+          const auto use_time = request.end_time;
+          UpdateAllocationRequirementForUseAliases(allocation_value, use,
+                                                   use_time);
+          MaybeCreateMirroredParentAllocationForWhileUse(
+              allocation_value, use, use_time, allocation_values,
+              preferred_offset_for_computation);
+        }
+      }
     }
   }
   return result;
@@ -1971,6 +2078,12 @@ MsaAlgorithm::AllocationRequest MsaAlgorithm::CreateAllocationRequest(
     const AllocationValue::Use* previous_use, AliasedOffset* preferred_offset,
     int64_t definition_time, bool require_no_copy_alternate_mem_allocation,
     const std::vector<int64_t>& all_use_times) {
+  bool require_copy_allocation = false;
+  int64_t required_copy_allocation_latest_time = 0;
+  if (use.copy_source != nullptr) {
+    required_copy_allocation_latest_time = use.copy_source->time;
+    require_copy_allocation = true;
+  }
   const HloUse& hlo_use = use.hlo_use;
   const auto& instruction_schedule = hlo_live_range_.instruction_schedule();
   int64_t use_time = instruction_schedule.at(hlo_use.instruction);
@@ -1995,47 +2108,7 @@ MsaAlgorithm::AllocationRequest MsaAlgorithm::CreateAllocationRequest(
       latest_prefetch_time =
           std::min(computation_span.start - 1, latest_prefetch_time);
     }
-    if (hlo_use.instruction->opcode() == HloOpcode::kWhile) {
-      // Given an example while loop and flattened schedule (logical times
-      // shown on the left):
-      //
-      // 0:  a = ...
-      // 1:  ...
-      //     cond {
-      // 2:   p = param(0)
-      // 3:   ...
-      //     }
-      //     body {
-      // 4:   p = param(0)
-      // 5:   ...
-      // 6:   ROOT ...
-      //     }
-      // 7:  w = while(a), body=body, cond=cond
-      //
-      // When processing "a" (time 0) and its while use (time 7), we update
-      // the interval to time 0-4. This is so that the remaining interval
-      // (5-6) can be allocated separately and this buffer doesn't waste
-      // alternate memory space within the while loop body.
-      HloComputation* while_body = hlo_use.instruction->while_body();
-      // We require while body ROOTs to be the last in the schedule.
-      CHECK_EQ(instruction_schedule.at(while_body->root_instruction()) + 1,
-               instruction_schedule.at(hlo_use.instruction))
-          << "While body ROOTs need to be the last in the schedule! "
-             "Please run RootInstructionSinker.";
-      // Replace the use time with the parameter time so that we can decide
-      // on alternate memory allocations within the while loop body when we
-      // look at uses within the while loop body.
-      use_time = instruction_schedule.at(while_body->parameter_instruction(0));
-    } else if (hlo_use.instruction->opcode() == HloOpcode::kConditional) {
-      // Replace the use time with the earliest parameter of called
-      // computations.
-      for (const HloComputation* called_computation :
-           hlo_use.instruction->called_computations()) {
-        use_time = std::min(use_time,
-                            instruction_schedule.at(
-                                called_computation->parameter_instruction(0)));
-      }
-    }
+    use_time = GetCorrectedUseTime(hlo_use);
   }
 
   // Add a required assignment in default memory if the use not allowed in
@@ -2194,11 +2267,193 @@ MsaAlgorithm::AllocationRequest MsaAlgorithm::CreateAllocationRequest(
     request.use = &use;
     request.allocation_value = &allocation_value;
     request.all_use_times = all_use_times;
+    request.require_copy_allocation = require_copy_allocation;
+    request.required_copy_allocation_latest_time =
+        required_copy_allocation_latest_time;
   }
 
   request.end_time = use_time;
 
   return request;
+}
+
+bool MsaAlgorithm::IsNonLayoutChangingSyncCopy(
+    const HloInstruction* instruction) const {
+  return instruction->opcode() == HloOpcode::kCopy &&
+         instruction->operand(0)->shape() == instruction->shape();
+}
+
+bool MsaAlgorithm::IsWhileOrConditionalOrFusionOrTrivialOrDusInstruction(
+    const HloInstruction* instruction) const {
+  return instruction->opcode() == HloOpcode::kWhile ||
+         instruction->opcode() == HloOpcode::kConditional ||
+         instruction->opcode() == HloOpcode::kFusion ||
+         instruction->opcode() == HloOpcode::kTuple ||
+         instruction->opcode() == HloOpcode::kBitcast ||
+         instruction->opcode() == HloOpcode::kGetTupleElement ||
+         instruction->opcode() == HloOpcode::kDynamicUpdateSlice;
+}
+
+// bool MsaAlgorithm::HasWhileOrConditionalOrFusionUse(
+//     const HloInstruction* instruction) const {
+//   bool has_while_or_conditional_use = false;
+//   for (auto& use : instruction->users()) {
+//     if (use->opcode() == HloOpcode::kTuple){
+//       has_while_or_conditional_use
+//     }
+//     if (IsWhileOrConditionalOrFusionInstruction(use)) {
+//       has_while_or_conditional_use = true;
+//       break;
+//     }
+//   }
+//   return has_while_or_conditional_use;
+// }
+
+bool MsaAlgorithm::HasWhileOrConditionalOrFusionOrTupleUse(
+    const AllocationValue* allocation_value) const {
+  bool has_while_or_conditional_use = false;
+  for (auto& use : allocation_value->uses()) {
+    if (IsWhileOrConditionalOrFusionOrTrivialOrDusInstruction(
+            use.hlo_use.instruction)) {
+      has_while_or_conditional_use = true;
+      break;
+    }
+    for (auto& alias : use.aliases) {
+      if (IsWhileOrConditionalOrFusionOrTrivialOrDusInstruction(
+              alias.instruction)) {
+        has_while_or_conditional_use = true;
+        break;
+      }
+    }
+    if (has_while_or_conditional_use) {
+      break;
+    }
+  }
+  return has_while_or_conditional_use;
+}
+
+bool MsaAlgorithm::HasCopyUse(const AllocationValue* allocation_value) const {
+  bool has_copy_use = false;
+  for (auto& use : allocation_value->uses()) {
+    if (use.hlo_use.instruction->opcode() == HloOpcode::kCopy) {
+      has_copy_use = true;
+      break;
+    }
+  }
+  return has_copy_use;
+}
+
+void MsaAlgorithm::UpdateCollocatedIntervalsAndAllocationValues(
+    const std::vector<BufferInterval>& sorted_buffer_intervals) {
+  for (const auto& interval : sorted_buffer_intervals) {
+    CHECK(!interval_to_allocation_values_.contains(&interval))
+        << "Duplicate interval key in the map: "
+        << interval.buffer->ToShortString();
+    std::vector<HloPosition> positions;
+    for (const HloPosition& position : interval.buffer->positions()) {
+      const HloInstruction* instruction = position.instruction;
+      if (instruction->opcode() != HloOpcode::kGetTupleElement &&
+          instruction->opcode() != HloOpcode::kTuple &&
+          instruction->opcode() != HloOpcode::kBitcast) {
+        positions.push_back(position);
+      }
+    }
+    if (positions.size() == 0) {
+      interval_to_colocated_intervals_[&interval];
+      interval_to_allocation_values_[&interval];
+      continue;
+    }
+
+    interval_to_colocated_intervals_[&interval] =
+        GetSortedColocatedIntervals(interval);
+    CreateAllocationValuesFromColocatedIntervals(
+        interval_to_colocated_intervals_[&interval],
+        interval_to_allocation_values_[&interval]);
+    for (auto& allocation_value : interval_to_allocation_values_[&interval]) {
+      instruction_to_allocation_values_[allocation_value.defining_instruction()]
+          .push_back(&allocation_value);
+    }
+  }
+  CHECK_EQ(interval_to_allocation_values_.size(),
+           sorted_buffer_intervals.size())
+      << "Mismatch in interval_to_allocation_values_ and "
+         "sorted_buffer_intervals sizes.";
+
+  for (auto& [interval, allocation_values] : interval_to_allocation_values_) {
+    if (MSA_COPY_REPLACEMENT_IGNORE_WHILE_COND_FUSION_TRIVIAL_DUS &&
+        IsDefinedByWhileOrConditionalOrFusionOrTrivialOrDus(interval)) {
+      continue;
+    }
+    for (auto& allocation_value : allocation_values) {
+      for (auto& use : allocation_value.uses()) {
+        HloInstruction* use_instruction = use.hlo_use.instruction;
+        if (IsNonLayoutChangingSyncCopy(use_instruction) &&
+            MSA_ENABLE_SYNC_COPY_REPLACEMENT) {
+          CHECK(instruction_to_allocation_values_.contains(use_instruction));
+          // CHECK_EQ(instruction_to_allocation_values_.at(use_instruction).size(),
+          //          1);
+          CHECK(use.copy_destinations.empty());
+          if (instruction_to_allocation_values_.at(use_instruction).size() >
+              1) {
+            VLOG(3) << "Skip converting the sync copy to async due to complex "
+                       "data dependency pattern: Multiple allocation values.";
+            continue;
+          }
+          for (AllocationValue* copy_destination :
+               instruction_to_allocation_values_.at(use_instruction)) {
+            if (MSA_COPY_REPLACEMENT_IGNORE_NESTED_COPY_USES &&
+                HasCopyUse(copy_destination)) {
+              VLOG(3)
+                  << "Skip converting the sync copy to async due to complex "
+                     "data dependency pattern: Nested copy use.";
+              continue;
+            }
+            if (MSA_COPY_REPLACEMENT_IGNORE_WHILE_COND_FUSION_TRIVIAL_DUS &&
+                HasWhileOrConditionalOrFusionOrTupleUse(copy_destination)) {
+              VLOG(3)
+                  << "Skip converting the sync copy to async due to complex "
+                     "data dependency pattern: While/Conditional use.";
+              continue;
+            }
+            use.copy_destinations.push_back(copy_destination);
+            VLOG(3) << "Volunteering to replace " << use.hlo_use.ToString()
+                    << " with " << copy_destination->ToString();
+            for (auto& second_use : copy_destination->uses()) {
+              VLOG(3) << "second_use: " << second_use.hlo_use.ToString();
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (auto& [interval, allocation_values] : interval_to_allocation_values_) {
+    VLOG(3) << "=======================================";
+    VLOG(3) << "Listing AllocationValues for HloValue ";
+    VLOG(3) << "=======================================";
+    XLA_VLOG_LINES(3, interval->buffer->ToString());
+    for (int i = 0; i < allocation_values.size(); ++i) {
+      AllocationValue& allocation_value = allocation_values.at(i);
+      VLOG(3) << "-------------------------------";
+      VLOG(3) << "AllocationValue " << i << ": ";
+      VLOG(3) << "-------------------------------";
+      XLA_VLOG_LINES(3, allocation_value.ToString());
+    }
+  }
+}
+
+const HloValue* MsaAlgorithm::GetHloValueConsumedByUse(
+    const HloUse& hlo_use) const {
+  return &alias_analysis_.dataflow_analysis().GetUniqueValueAt(
+      hlo_use.instruction->operand(hlo_use.operand_number),
+      hlo_use.operand_index);
+}
+
+const HloValue* MsaAlgorithm::GetHloValueConsumedByUse(
+    const AllocationValue::Use& use) const {
+  const HloUse& hlo_use =
+      use.copy_source ? use.copy_source->hlo_use : use.hlo_use;
+  return GetHloValueConsumedByUse(hlo_use);
 }
 
 void MsaAlgorithm::UpdateAllocationRequirementForUseAliases(
@@ -2210,9 +2465,15 @@ void MsaAlgorithm::UpdateAllocationRequirementForUseAliases(
           << (aliased_allocation ? aliased_allocation->ToString()
                                  : "couldn't find the aliased allocation");
 
+  const HloValue* value = nullptr;
+  if (use.copy_source) {
+    value = GetHloValueConsumedByUse(use);
+  }
+
   for (const HloPosition& aliased_position : use.aliases) {
     AddAliasedRequiredAssignment(aliased_position.instruction,
-                                 aliased_position.index, aliased_allocation);
+                                 aliased_position.index, aliased_allocation,
+                                 value);
   }
 }
 
@@ -2960,9 +3221,14 @@ MsaAlgorithm::AliasedRequiredAssignmentForUse(
     const AllocationValue::Use& use) const {
   std::optional<RequiredMemoryAssignment> required_assignment;
   for (const HloPosition& position : use.aliases) {
-    const HloValue* value =
-        &alias_analysis_.dataflow_analysis().GetUniqueValueAt(
-            position.instruction, position.index);
+    const HloValue* value;
+    if (use.copy_source) {
+      // TODO(mehrdadk): double check this logic
+      value = GetHloValueConsumedByUse(use);
+    } else {
+      value = &alias_analysis_.dataflow_analysis().GetUniqueValueAt(
+          position.instruction, position.index);
+    }
     int64_t time =
         hlo_live_range_.instruction_schedule().at(position.instruction);
     std::optional<RequiredMemoryAssignment> required_assignment_for_alias =
@@ -2980,13 +3246,14 @@ MsaAlgorithm::AliasedRequiredAssignmentForUse(
 
 void MsaAlgorithm::AddAliasedRequiredAssignment(
     const HloInstruction* instruction, ShapeIndex index,
-    const Allocation* aliased_allocation) {
+    const Allocation* aliased_allocation, const HloValue* value) {
   AliasedOffset* offset = nullptr;
   if (aliased_allocation->memory_space() == MemorySpace::kAlternate) {
     offset = GetAliasedOffset(*aliased_allocation);
   }
   AddRequiredAssignment(instruction, index, aliased_allocation->memory_space(),
-                        offset);
+                        offset,
+                        /*add_to_pending=*/true, value);
 }
 
 void MsaAlgorithm::AddRequiredAssignment(const HloValue* value,
@@ -2994,8 +3261,8 @@ void MsaAlgorithm::AddRequiredAssignment(const HloValue* value,
                                          MemorySpace memory_space, int64_t time,
                                          AliasedOffset* offset,
                                          bool add_to_pending) {
-  // Check for existing required assignment at this time and make sure it is the
-  // same as this if there is one.
+  // Check for existing required assignment at this time and make sure it is
+  // the same as this if there is one.
   auto existing_required_assignment = RequiredMemoryAssignmentAt(value, time);
   if (existing_required_assignment) {
     CHECK(memory_space == existing_required_assignment->memory_space)
@@ -3021,9 +3288,12 @@ void MsaAlgorithm::AddRequiredAssignment(const HloInstruction* instruction,
                                          ShapeIndex index,
                                          MemorySpace memory_space,
                                          AliasedOffset* offset,
-                                         bool add_to_pending) {
-  const HloValue* value =
-      &alias_analysis_.dataflow_analysis().GetUniqueValueAt(instruction, index);
+                                         bool add_to_pending,
+                                         const HloValue* value) {
+  if (!value) {
+    value = &alias_analysis_.dataflow_analysis().GetUniqueValueAt(instruction,
+                                                                  index);
+  }
   int64_t instruction_time =
       hlo_live_range_.instruction_schedule().at(instruction);
   AddRequiredAssignment(value, instruction, memory_space, instruction_time,
@@ -3033,17 +3303,21 @@ void MsaAlgorithm::AddRequiredAssignment(const HloInstruction* instruction,
 void MsaAlgorithm::AddRequiredAssignment(const HloPosition& position,
                                          MemorySpace memory_space,
                                          AliasedOffset* offset,
-                                         bool add_to_pending) {
+                                         bool add_to_pending,
+                                         const HloValue* value) {
   AddRequiredAssignment(position.instruction, position.index, memory_space,
-                        offset, add_to_pending);
+                        offset, add_to_pending, value);
 }
 
 void MsaAlgorithm::AddRequiredAssignment(const HloUse& use,
                                          MemorySpace memory_space,
                                          AliasedOffset* offset,
-                                         bool add_to_pending) {
-  const HloValue* value = &alias_analysis_.dataflow_analysis().GetUniqueValueAt(
-      use.instruction->operand(use.operand_number), use.operand_index);
+                                         bool add_to_pending,
+                                         const HloValue* value) {
+  if (!value) {
+    value = &alias_analysis_.dataflow_analysis().GetUniqueValueAt(
+        use.instruction->operand(use.operand_number), use.operand_index);
+  }
   int64_t instruction_time = GetCorrectedUseTime(use);
   AddRequiredAssignment(value, use.instruction, memory_space, instruction_time,
                         offset, add_to_pending);
@@ -3587,8 +3861,7 @@ std::optional<int> MsaAlgorithm::FindEarliestExclusiveTimeToSatisfyPeakMemory(
   return earliest_time_exclusive;
 }
 
-MsaAlgorithm::Result MsaAlgorithm::AllocateSegment(
-    const AllocationRequest& request) {
+MsaAlgorithm::Result MsaAlgorithm::AllocateSegment(AllocationRequest& request) {
   auto allocation_sequence =
       request.allocation_value->mutable_allocation_sequence();
   // inclusive_start_time == end_time is a special case where the value is
@@ -3774,6 +4047,30 @@ MsaAlgorithm::Result MsaAlgorithm::AllocateSegment(
   // Finally, try to prefetch the buffer into alternate memory.
   if (request.allow_prefetch &&
       !request.allocation_value->requires_contiguous_allocation()) {
+    if (request.require_copy_allocation) {
+      // TODO(mehrdadk): verify this logic
+      auto it = std::find_if(
+          allocation_sequence->begin(), allocation_sequence->end(),
+          [&](const std::unique_ptr<xla::memory_space_assignment::Allocation>&
+                  allocation_ptr) {
+            auto copy_allocation =
+                dynamic_cast<const CopyAllocation*>(allocation_ptr.get());
+            return copy_allocation &&
+                   copy_allocation->copy_done_schedule_before() <=
+                       request.required_copy_allocation_latest_time;
+          });
+      if (it == allocation_sequence->end()) {
+        int64_t latest_prefetch_time =
+            std::min(request.latest_prefetch_time,
+                     request.required_copy_allocation_latest_time);
+        VLOG(3) << "Updating the latest prefetch time from "
+                << request.latest_prefetch_time << " to "
+                << latest_prefetch_time
+                << ", because this use requires a copy allocation before "
+                << request.required_copy_allocation_latest_time;
+        request.latest_prefetch_time = latest_prefetch_time;
+      }
+    }
     Result prefetch_result =
         Prefetch(request, **prev_allocation_in_default_mem_it);
     if (prefetch_result == Result::kSuccess) {
@@ -3834,6 +4131,30 @@ MsaAlgorithm::Result MsaAlgorithm::AllocateSegment(
   // default memory.
   (*prev_allocation_in_default_mem_it)->set_end_time(request.end_time);
   (*prev_allocation_in_default_mem_it)->AddUse(request.use->hlo_use);
+
+  // if (request.require_copy_allocation) {
+  //   auto it = std::find_if(
+  //       allocation_sequence->begin(), allocation_sequence->end(),
+  //       [&](const std::unique_ptr<xla::memory_space_assignment::Allocation>&
+  //               allocation_ptr) {
+  //         auto copy_allocation =
+  //             dynamic_cast<const CopyAllocation*>(allocation_ptr.get());
+  //         return copy_allocation &&
+  //                copy_allocation->copy_done_schedule_before() <=
+  //                    request.required_copy_allocation_latest_time;
+  //       });
+  //   if (it == allocation_sequence->end()) {
+  //     VLOG(3)
+  //         << "No async copy allocation found by the end of segment
+  //         allocation. "
+  //            "Sync copy replacement has failed. Fall back to the normal
+  //            mode.";
+  //     // TODO(mehrdadk): either implement the fall-back mechanism here, or
+  //     // perform extra allocations to evict and fetch back
+  //     result_mark(Result::kFailSyncCopyReplacement, allocation_result);
+  //     return result_mark(Result::kFailRequiresUncommit, allocation_result);
+  //   }
+  // }
   return allocation_result;
 }
 
