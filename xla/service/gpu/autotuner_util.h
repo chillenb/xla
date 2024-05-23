@@ -30,9 +30,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "xla/autotune_results.pb.h"
 #include "xla/autotuning.pb.h"
-#include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
-#include "xla/hlo/ir/hlo_module.h"
 #include "xla/shape.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_memory.h"
@@ -287,6 +285,9 @@ struct AutotunerUtil {
 
   static void ClearAutotuneResults();
 };
+
+absl::StatusOr<std::string> AutotuneResultsToString(
+    const AutotuneResults& results, bool as_textproto);
 
 }  // namespace gpu
 }  // namespace xla
