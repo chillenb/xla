@@ -32,6 +32,13 @@ std::vector<const XPlane*> FindTensorCorePlanes(const XSpace& xspace) {
   });
 }
 
+std::vector<const XPlane*> FindTpuSystemPlanes(const XSpace& xspace) {
+  return FindPlanes(xspace, [](const XPlane& xplane) {
+    static const LazyRE2 re = {kTpuSystemPlaneRegex};
+    return RE2::FullMatch(xplane.name(), *re);
+  });
+}
+
 std::vector<XPlane*> FindMutableTensorCorePlanes(XSpace* xspace) {
   return FindMutablePlanes(xspace, [](const XPlane& xplane) {
     static const LazyRE2 re = {kTpuPlaneRegex};
