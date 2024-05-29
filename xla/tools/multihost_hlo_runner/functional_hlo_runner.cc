@@ -1279,6 +1279,7 @@ FunctionalHloRunner::CopyArgumentsToDevice(
     PjRtClient& client, const PjRtLoadedExecutable* executable,
     const PerDeviceLiteralVecType& arguments, bool log_input,
     bool flattened_arguments, bool clone_device0_arguments) {
+  LOG(INFO) << "[SANS_SOUCI] Copying args to device";
   absl::Span<PjRtDevice* const> addressable_devices =
       executable->addressable_devices();
   size_t num_addressable_devices = addressable_devices.size();
@@ -1323,11 +1324,14 @@ FunctionalHloRunner::CopyArgumentsToDevice(
                                       const Literal& literal)
       -> absl::StatusOr<std::unique_ptr<PjRtBuffer>> {
     if (client.memory_spaces().empty()) {
-      return client.BufferFromHostLiteral(literal, device);
+      return client.BufferFromHostLiteral(
+          literal, device,
+          literal.shape().has_layout() ? &literal.shape().layout() : nullptr);
     }
     TF_ASSIGN_OR_RETURN(PjRtMemorySpace * memory_space,
                         argument_memory_space(module, device, arg_i));
-    return client.BufferFromHostLiteral(literal, memory_space);
+    return client.BufferFromHostLiteral(literal, memory_space,
+                                        /* device_layout */ nullptr);
   };
 
   absl::Span<const PjRtLoadedExecutable::LogicalDeviceIds>

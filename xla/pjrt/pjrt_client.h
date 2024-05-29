@@ -896,6 +896,12 @@ class PjRtClient {
   virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
       const LiteralSlice& literal, PjRtDevice* device) = 0;
 
+  virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
+      const LiteralSlice& literal, PjRtDevice* device,
+      const Layout* device_layout) {
+    return this->BufferFromHostLiteral(literal, device);
+  }
+
   // TODO(b/277820585): remove BufferFromHostLiteral with PjRtDevice after the
   // migration is done.
   virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
@@ -904,6 +910,12 @@ class PjRtClient {
         "BufferFromHostLiteral with PjRtMemorySpace is not implemented on "
         "platform: ",
         platform_name());
+  }
+
+  virtual absl::StatusOr<std::unique_ptr<PjRtBuffer>> BufferFromHostLiteral(
+      const LiteralSlice& literal, PjRtMemorySpace* memory_space,
+      const Layout* device_layout) {
+    return this->BufferFromHostLiteral(literal, memory_space);
   }
 
   // Creates a PjRtBuffer that is a non-owned view of an on-device
