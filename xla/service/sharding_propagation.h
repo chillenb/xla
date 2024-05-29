@@ -32,6 +32,19 @@ limitations under the License.
 
 namespace xla {
 
+std::optional<HloSharding> ConstructImprovedSharding(
+    HloSharding from, const HloSharding& to_improved,
+    const Shape& to_improved_shape, bool may_combine_partial_sharding,
+    bool allow_aggressive_resharding = false);
+
+// Infer output sharding on index parallel dimensions for gather/scatter from
+// gather operand/indices or scatter operands/indices/updates.
+HloSharding InferParallelShardingFromOperandSharding(
+    const HloSharding& operand_sharding, const Shape& operand_shape,
+    const Shape& shape,
+    absl::Span<const int64_t> output_aligned_operand_parallel_dims,
+    absl::Span<const int64_t> output_parallel_dims);
+
 // Infers the shardings for a dot HLO op from the shardings on its operands,
 // which are expected to have sharding annotations.
 bool InferDotShardingFromOperands(

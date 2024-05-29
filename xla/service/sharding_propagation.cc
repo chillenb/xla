@@ -567,57 +567,6 @@ std::optional<HloSharding> LookaheadUserSharding(HloInstruction* instr,
   return sharding;
 }
 
-// Infer output sharding on index parallel dimensions for gather/scatter from
-// gather operand/indices or scatter operands/indices/updates.
-HloSharding InferParallelShardingFromOperand(
-    const HloInstruction* operand, const Shape& shape,
-    absl::Span<const int64_t> output_aligned_operand_parallel_dims,
-    absl::Span<const int64_t> output_parallel_dims) {
-  const HloSharding& operand_sharding = operand->sharding();
-  if (operand_sharding.IsTileMaximal()) {
-    return operand_sharding;
-  }
-  std::vector<int64_t> output_tile_dims(shape.rank(), 1);
-  std::vector<int64_t> operand_non_parallel_dims;
-  operand_non_parallel_dims.reserve(operand->shape().rank());
-  // Detect non parallel dimensions in the operand.
-  for (int i = 0; i < operand->shape().rank(); ++i) {
-    if (!absl::c_linear_search(output_aligned_operand_parallel_dims, i)) {
-      operand_non_parallel_dims.push_back(i);
-    }
-  }
-  // Collect tile dimensions in the operand. The order of the parallel
-  // dimensions in output_aligned_operand_parallel_dims is the same as that of
-  // the output
-  for (int i = 0; i < output_aligned_operand_parallel_dims.size(); ++i) {
-    const int64_t operand_idx = output_aligned_operand_parallel_dims[i];
-    const int64_t output_idx = output_parallel_dims[i];
-    output_tile_dims[output_idx] =
-        operand_sharding.tile_assignment().dim(operand_idx);
-  }
-  HloSharding replicate_non_parallel_dims =
-      hlo_sharding_util::PartiallyReplicateTiledShardingOnDims(
-          operand_sharding, operand_non_parallel_dims);
-  if (replicate_non_parallel_dims.IsTileMaximal()) {
-    return replicate_non_parallel_dims;
-  }
-  for (int64_t i = replicate_non_parallel_dims.TiledDataRank();
-       i < replicate_non_parallel_dims.tile_assignment().num_dimensions();
-       ++i) {
-    output_tile_dims.push_back(
-        replicate_non_parallel_dims.tile_assignment().dim(i));
-  }
-  auto output_tile_assignment =
-      replicate_non_parallel_dims.tile_assignment().Reshape(output_tile_dims);
-  return replicate_non_parallel_dims.ReplicateOnLastTileDim()
-             ? HloSharding::PartialTile(output_tile_assignment,
-                                        replicate_non_parallel_dims.metadata())
-             : HloSharding::Subgroup(
-                   output_tile_assignment,
-                   replicate_non_parallel_dims.subgroup_types(),
-                   replicate_non_parallel_dims.metadata());
-}
-
 // Infer output sharding on index parallel dimensions for gather from operand
 // and indices.
 bool InferGatherParallelShardingFromOperands(
@@ -633,8 +582,9 @@ bool InferGatherParallelShardingFromOperands(
   // Infer output sharding from scatter operand sharding.
   if (IsSpatiallyPartitioned(instruction->operand(0))) {
     changed |= MaybeImproveInstructionSharding(
-        InferParallelShardingFromOperand(
-            instruction->operand(0), instruction->shape(),
+        InferParallelShardingFromOperandSharding(
+            instruction->operand(0)->sharding(),
+            instruction->operand(0)->shape(), instruction->shape(),
             absl::MakeConstSpan(aligned_operand_parallel_dims),
             absl::MakeConstSpan(output_parallel_dims)),
         instruction, may_combine_partial_sharding);
@@ -642,8 +592,9 @@ bool InferGatherParallelShardingFromOperands(
   // Infer output sharding from scatter indices sharding.
   if (IsSpatiallyPartitioned(instruction->operand(1))) {
     changed |= MaybeImproveInstructionSharding(
-        InferParallelShardingFromOperand(
-            instruction->operand(1), instruction->shape(),
+        InferParallelShardingFromOperandSharding(
+            instruction->operand(1)->sharding(),
+            instruction->operand(1)->shape(), instruction->shape(),
             absl::MakeConstSpan(parallel_dims.indices_parallel_dims),
             absl::MakeConstSpan(output_parallel_dims)),
         instruction, may_combine_partial_sharding);
@@ -676,19 +627,20 @@ bool InferScatterParallelShardingFromOperands(
   for (int64_t i = 0; i != operand_count; ++i) {
     if (IsSpatiallyPartitioned(scatter_operands[i])) {
       changed |= MaybeImproveInstructionSubSharding(
-          InferParallelShardingFromOperand(
-              scatter_operands[i], shape,
-              absl::MakeConstSpan(aligned_operand_parallel_dims),
+          InferParallelShardingFromOperandSharding(
+              scatter_operands[i]->sharding(), scatter_operands[i]->shape(),
+              shape, absl::MakeConstSpan(aligned_operand_parallel_dims),
               absl::MakeConstSpan(output_parallel_dims)),
           instruction, {i}, may_combine_partial_sharding);
     }
   }
   // Infer output sharding from scatter indices sharding.
   if (IsSpatiallyPartitioned(scatter_indices)) {
-    auto parallel_sharding_from_indices = InferParallelShardingFromOperand(
-        scatter_indices, shape,
-        absl::MakeConstSpan(parallel_dims.indices_parallel_dims),
-        absl::MakeConstSpan(output_parallel_dims));
+    auto parallel_sharding_from_indices =
+        InferParallelShardingFromOperandSharding(
+            scatter_indices->sharding(), scatter_indices->shape(), shape,
+            absl::MakeConstSpan(parallel_dims.indices_parallel_dims),
+            absl::MakeConstSpan(output_parallel_dims));
     for (int64_t i = 0; i != operand_count; ++i) {
       changed |= MaybeImproveInstructionSubSharding(
           parallel_sharding_from_indices, instruction, {i},
@@ -699,9 +651,9 @@ bool InferScatterParallelShardingFromOperands(
   for (int64_t i = 0; i != operand_count; ++i) {
     if (IsSpatiallyPartitioned(scatter_updates[i])) {
       changed |= MaybeImproveInstructionSubSharding(
-          InferParallelShardingFromOperand(
-              scatter_updates[i], shape,
-              absl::MakeConstSpan(update_parallel_dims),
+          InferParallelShardingFromOperandSharding(
+              scatter_updates[i]->sharding(), scatter_updates[i]->shape(),
+              shape, absl::MakeConstSpan(update_parallel_dims),
               absl::MakeConstSpan(output_parallel_dims)),
           instruction, {i}, may_combine_partial_sharding);
     }
@@ -1293,6 +1245,66 @@ bool IsCSEPreventionSharding(const HloSharding& sharding) {
 }
 
 }  // namespace
+
+std::optional<HloSharding> ConstructImprovedSharding(
+    HloSharding from, const HloSharding& to_improved,
+    const Shape& to_improved_shape, bool may_combine_partial_sharding,
+    bool allow_aggressive_resharding) {
+  return ReturnImprovedShardingImpl(from, &to_improved, to_improved_shape,
+                                    may_combine_partial_sharding,
+                                    allow_aggressive_resharding);
+}
+
+// Infer output sharding on index parallel dimensions for gather/scatter from
+// gather operand/indices or scatter operands/indices/updates.
+HloSharding InferParallelShardingFromOperandSharding(
+    const HloSharding& operand_sharding, const Shape& operand_shape,
+    const Shape& shape,
+    absl::Span<const int64_t> output_aligned_operand_parallel_dims,
+    absl::Span<const int64_t> output_parallel_dims) {
+  if (operand_sharding.IsTileMaximal()) {
+    return operand_sharding;
+  }
+  std::vector<int64_t> output_tile_dims(shape.rank(), 1);
+  std::vector<int64_t> operand_non_parallel_dims;
+  operand_non_parallel_dims.reserve(operand_shape.rank());
+  // Detect non parallel dimensions in the operand.
+  for (int i = 0; i < operand_shape.rank(); ++i) {
+    if (!absl::c_linear_search(output_aligned_operand_parallel_dims, i)) {
+      operand_non_parallel_dims.push_back(i);
+    }
+  }
+  // Collect tile dimensions in the operand. The order of the parallel
+  // dimensions in output_aligned_operand_parallel_dims is the same as that of
+  // the output
+  for (int i = 0; i < output_aligned_operand_parallel_dims.size(); ++i) {
+    const int64_t operand_idx = output_aligned_operand_parallel_dims[i];
+    const int64_t output_idx = output_parallel_dims[i];
+    output_tile_dims[output_idx] =
+        operand_sharding.tile_assignment().dim(operand_idx);
+  }
+  HloSharding replicate_non_parallel_dims =
+      hlo_sharding_util::PartiallyReplicateTiledShardingOnDims(
+          operand_sharding, operand_non_parallel_dims);
+  if (replicate_non_parallel_dims.IsTileMaximal()) {
+    return replicate_non_parallel_dims;
+  }
+  for (int64_t i = replicate_non_parallel_dims.TiledDataRank();
+       i < replicate_non_parallel_dims.tile_assignment().num_dimensions();
+       ++i) {
+    output_tile_dims.push_back(
+        replicate_non_parallel_dims.tile_assignment().dim(i));
+  }
+  auto output_tile_assignment =
+      replicate_non_parallel_dims.tile_assignment().Reshape(output_tile_dims);
+  return replicate_non_parallel_dims.ReplicateOnLastTileDim()
+             ? HloSharding::PartialTile(output_tile_assignment,
+                                        replicate_non_parallel_dims.metadata())
+             : HloSharding::Subgroup(
+                   output_tile_assignment,
+                   replicate_non_parallel_dims.subgroup_types(),
+                   replicate_non_parallel_dims.metadata());
+}
 
 bool InferDotShardingFromOperands(
     HloInstruction* instruction, const CallGraph& call_graph,
