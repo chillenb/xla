@@ -13,27 +13,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "xla/service/cpu/runtime/call_thunk.h"
+#include "xla/runtime/buffer_use.h"
 
-#include <utility>
+#include "xla/service/buffer_assignment.h"
+#include "tsl/platform/test.h"
 
-#include "absl/status/status.h"
-#include "xla/service/cpu/runtime/thunk.h"
-#include "tsl/profiler/lib/traceme.h"
+namespace xla {
+namespace {
 
-namespace xla::cpu {
+TEST(BufferUseTest, EqualityTest) {
+  BufferAllocation alloc0(/*index=*/0, /*size=*/1024, /*color=*/0);
 
-CallThunk::CallThunk(Info info, ThunkSequence called_sequence)
-    : Thunk(Kind::kCall, std::move(info)),
-      called_sequence_(std::move(called_sequence)) {}
+  BufferAllocation::Slice slice0(&alloc0, 0, 10);
 
-absl::Status CallThunk::Execute(const ExecuteParams& params) {
-  tsl::profiler::TraceMe trace([&] { return TraceMeEncode(); });
-  return called_sequence_.Execute(params);
+  BufferUse use0(slice0, BufferUse::MemoryAccess::kRead);
+  BufferUse use1(slice0, BufferUse::MemoryAccess::kWrite);
+  BufferUse use2(slice0, BufferUse::MemoryAccess::kRead);
+
+  EXPECT_NE(use0, use1);
+  EXPECT_EQ(use0, use2);
 }
 
-CallThunk::BufferUses CallThunk::buffer_uses() const {
-  return called_sequence_.buffer_uses();
-}
-
-}  // namespace xla::cpu
+}  // namespace
+}  // namespace xla

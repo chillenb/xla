@@ -82,4 +82,12 @@ absl::Status OutfeedThunk::Execute(const ExecuteParams& params) {
   return absl::OkStatus();
 }
 
+OutfeedThunk::BufferUses OutfeedThunk::buffer_uses() const {
+  BufferUses buffer_uses;
+  for (const OutfeedBuffer& outfeed_buffer : outfeed_buffers_) {
+    buffer_uses.emplace_back(outfeed_buffer.slice, BufferUse::kRead);
+  }
+  return buffer_uses;
+}
+
 }  // namespace xla::cpu
