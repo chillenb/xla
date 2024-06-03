@@ -74,6 +74,13 @@ absl::StatusOr<bool> ProcessShardingInstruction(
     const std::vector<bool>*
         allow_spmd_sharding_propagation_to_parameters_vector = nullptr);
 
+// Remove redundant copy instructions, which are usually converted from Sharding
+// custom-calls by ProcessShardingInstruction. A copy instruction is redundant
+// if it shares the same sharding with its operand.
+absl::StatusOr<bool> RemoveRedundantCopyInstructions(
+    HloModule* module,
+    const absl::flat_hash_set<absl::string_view>& execution_threads);
+
 int64_t ComputeNonRootUsers(const HloInstruction* instr);
 
 // Infers broadcast ops' operand sharding, based on its output sharding.

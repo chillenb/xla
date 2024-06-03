@@ -1759,6 +1759,30 @@ absl::StatusOr<bool> ProcessShardingInstruction(
   return changed;
 }
 
+absl::StatusOr<bool> RemoveRedundantCopyInstructions(
+    HloModule* module,
+    const absl::flat_hash_set<absl::string_view>& execution_threads) {
+  bool global_changed = false;
+  for (HloComputation* computation : module->computations(execution_threads)) {
+    for (HloInstruction* instruction : computation->instructions()) {
+      if (instruction->opcode() == HloOpcode::kCopy &&
+          instruction->has_sharding() &&
+          instruction->operand(0)->has_sharding() &&
+          instruction->operand(0)->sharding() == instruction->sharding()) {
+        TF_ASSIGN_OR_RETURN(
+            bool local_changed,
+            computation->ReplaceInstruction(
+                instruction, instruction->mutable_operand(0),
+                /*preserve_sharding=*/false, /*relay_control_dependency=*/false,
+                /*remove_unused_operands=*/false));
+        CHECK(local_changed);
+        global_changed = true;
+      }
+    }
+  }
+  return global_changed;
+}
+
 // Compute the number of users that are only internal to the computation.
 int64_t ComputeNonRootUsers(const HloInstruction* instr) {
   int64_t non_root_users = instr->users().size();
@@ -3718,6 +3742,10 @@ absl::StatusOr<bool> ShardingPropagation::Run(
       params[0]->set_sharding(std::move(param_sharding));
     }
   }
+
+  TF_ASSIGN_OR_RETURN(
+      changed, RemoveRedundantCopyInstructions(module, execution_threads));
+  any_changed |= changed;
 
   TF_RETURN_IF_ERROR(
       hlo_sharding_util::CanonicalizeLayoutAfterShardingPropagation(
