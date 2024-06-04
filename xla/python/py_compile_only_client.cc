@@ -179,6 +179,13 @@ class CompileOnlyIfRtClient final
         "client.");
   }
 
+  absl::StatusOr<std::vector<tsl::RCReference<ifrt::Array>>> ReshardArrays(
+      absl::Span<ReshardArrayArg> args,
+      ifrt::ArrayCopySemantics semantics) override {
+    return Unimplemented(
+        "ReshardArrays not available with compile-only client.");
+  }
+
   absl::StatusOr<std::vector<tsl::RCReference<ifrt::Array>>> RemapArrays(
       const ifrt::RemapPlan& plan,
       absl::Span<tsl::RCReference<ifrt::Array>> arrays,

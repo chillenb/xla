@@ -119,6 +119,29 @@ class Client : public llvm::RTTIExtends<Client, llvm::RTTIRoot> {
       absl::Span<tsl::RCReference<Array>> arrays,
       ArrayCopySemantics semantics) = 0;
 
+  // Copies the arrays with new shardings, creating new arrays.
+  //
+  // Resharding falls into one of the three cases:
+  //
+  // * Metadata-only resharding: Use a new sharding for the array that expects
+  //   the same physical layout of underlying buffers on the same devices.
+  // * 1-to-1 buffer copy: Copy individual buffers to different devices without
+  //   altering their physical layout.
+  // * M-to-N buffer resharding: Shuffle the buffer data across the boundary of
+  //   the buffers, changing their physical layout.
+  //
+  // Implementations may return `UNIMPLEMENTED` if they do not know how to copy
+  // or reshuffle the data to match the new sharding.
+  //
+  // It may fail if the buffer data would be sent from/to an unaddressable
+  // device.
+  struct ReshardArrayArg {
+    tsl::RCReference<Array> array;
+    std::shared_ptr<const Sharding> sharding;
+  };
+  virtual absl::StatusOr<std::vector<tsl::RCReference<Array>>> ReshardArrays(
+      absl::Span<ReshardArrayArg> args, ArrayCopySemantics semantics) = 0;
+
   // Remaps shards across input `Array`s to create new `Array`s based on `plan`.
   // This array remapping is a metadata-only operation that can shuffle or
   // extract shards without changing their per-shard interpretation and causing

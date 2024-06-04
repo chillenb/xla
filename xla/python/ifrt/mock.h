@@ -122,6 +122,10 @@ class MockClient : public llvm::RTTIExtends<MockClient, Client> {
                absl::Span<tsl::RCReference<Array>> arrays,
                ArrayCopySemantics semantics),
               (final));
+  MOCK_METHOD(absl::StatusOr<std::vector<tsl::RCReference<Array>>>,
+              ReshardArrays,
+              (absl::Span<ReshardArrayArg> args, ArrayCopySemantics semantics),
+              (final));
   MOCK_METHOD(absl::StatusOr<std::vector<tsl::RCReference<Array>>>, RemapArrays,
               (const RemapPlan& plan,
                absl::Span<tsl::RCReference<Array>> arrays,

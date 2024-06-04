@@ -201,6 +201,26 @@ Client::AssembleArrayFromSingleDeviceArrays(
 }
 
 absl::StatusOr<std::vector<tsl::RCReference<xla::ifrt::Array>>>
+Client::ReshardArrays(absl::Span<ReshardArrayArg> args,
+                      ArrayCopySemantics semantics) {
+  // TODO(b/343992694): Implement a batched version natively and deprecate the
+  // non-batched version.
+  std::vector<tsl::RCReference<xla::ifrt::Array>> arrays;
+  arrays.reserve(args.size());
+  for (const auto& arg : args) {
+    auto* proxy_array =
+        llvm::dyn_cast<xla::ifrt::proxy::Array>(arg.array.get());
+    if (proxy_array == nullptr) {
+      return absl::UnimplementedError(
+          "ReshardArrays can handle Array from IFRT Proxy only");
+    }
+    TF_ASSIGN_OR_RETURN(arrays.emplace_back(),
+                        proxy_array->Reshard(arg.sharding, semantics));
+  }
+  return arrays;
+}
+
+absl::StatusOr<std::vector<tsl::RCReference<xla::ifrt::Array>>>
 Client::RemapArrays(const RemapPlan& plan,
                     absl::Span<tsl::RCReference<xla::ifrt::Array>> arrays,
                     ArrayCopySemantics semantics) {

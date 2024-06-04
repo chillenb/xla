@@ -516,6 +516,22 @@ PjRtClient::AssembleArrayFromSingleDeviceArrays(
                            std::move(buffers));
 }
 
+absl::StatusOr<std::vector<tsl::RCReference<Array>>> PjRtClient::ReshardArrays(
+    absl::Span<ReshardArrayArg> args, ArrayCopySemantics semantics) {
+  std::vector<tsl::RCReference<Array>> arrays;
+  arrays.reserve(args.size());
+  for (const auto& arg : args) {
+    auto* pjrt_array = llvm::dyn_cast<PjRtArray>(arg.array.get());
+    if (pjrt_array == nullptr) {
+      return absl::UnimplementedError(
+          "PjRtClient::ReshardArrays can handle PjRtArray only");
+    }
+    TF_ASSIGN_OR_RETURN(arrays.emplace_back(),
+                        pjrt_array->Reshard(arg.sharding, semantics));
+  }
+  return arrays;
+}
+
 absl::StatusOr<std::vector<tsl::RCReference<xla::ifrt::Array>>>
 PjRtClient::RemapArrays(const RemapPlan& plan,
                         absl::Span<tsl::RCReference<xla::ifrt::Array>> arrays,
