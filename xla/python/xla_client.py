@@ -543,7 +543,6 @@ DeviceList = _xla.DeviceList
 OpSharding = _xla.OpSharding
 HloSharding = _xla.HloSharding
 Sharding = _xla.Sharding
-XLACompatibleSharding = _xla.XLACompatibleSharding
 NamedSharding = _xla.NamedSharding
 SingleDeviceSharding = _xla.SingleDeviceSharding
 PmapSharding = _xla.PmapSharding
