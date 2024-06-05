@@ -24,6 +24,10 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 
+#if defined(XLA_SERVICE_CPU_USE_BLIS_GEMM)
+#include "bli_type_defs.h"
+#endif
+
 // These classes are forward declared so that ExecutableRunOptions can be linked
 // into an XLA-compiled binary without having to link all of the pointed-to
 // objects (e.g., for an ahead-of-time compiled CPU binary, the gpu tools don't
@@ -255,6 +259,10 @@ class ExecutableRunOptions {
   const cpu::CpuExecutableRunOptions* cpu_executable_run_options_ = nullptr;
   const gpu::GpuExecutableRunOptions* gpu_executable_run_options_ = nullptr;
   const ffi::ExecutionContext* ffi_execution_context_ = nullptr;
+#if defined(XLA_SERVICE_CPU_USE_BLIS_GEMM)
+  rntm_t *blis_runtime_ = nullptr;
+  cntx_t *blis_context_ = nullptr;
+#endif
 };
 
 }  // namespace xla

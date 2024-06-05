@@ -93,6 +93,30 @@ const Eigen::ThreadPoolDevice* ExecutableRunOptions::intra_op_thread_pool()
   return intra_op_thread_pool_;
 }
 
+#if defined(XLA_SERVICE_CPU_USE_BLIS_GEMM)
+
+const rntm_t* ExecutableRunOptions::blis_runtime() const {
+    return blis_runtime_;
+  }
+
+ExecutableRunOptions& ExecutableRunOptions::set_blis_runtime(
+    const rntm_t *blis_runtime) {
+  blis_runtime_ = blis_runtime;
+  return *this;
+}
+
+const cntx_t* ExecutableRunOptions::blis_context() const {
+    return blis_context_;
+  }
+
+ExecutableRunOptions& ExecutableRunOptions::set_blis_context(
+    const cntx_t *blis_context) {
+  blis_context_ = blis_context;
+  return *this;
+}
+
+#endif
+
 ExecutableRunOptions& ExecutableRunOptions::set_execution_profile(
     ExecutionProfile* profile) {
   execution_profile_ = profile;

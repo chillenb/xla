@@ -474,6 +474,9 @@ absl::Status DotOpEmitter::Emit() {
 
     case DotImplementationStrategy::kEigen:
       return EmitCallToRuntime();
+
+    case DotImplementationStrategy::kBlis:
+      return EmitBlisGemm();
   }
 }
 

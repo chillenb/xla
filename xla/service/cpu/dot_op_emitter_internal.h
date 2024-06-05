@@ -74,6 +74,11 @@ enum class DotImplementationStrategy {
   // GEMM -- we expose this flexibility as flexibility in the contraction
   // dimensions, but we can also see this as flexibility in the input layouts.
   kEigen,
+
+  // The dot operation is lowered into a call into a BLIS routine. This allows
+  // for inputs with any row and column strides. Of course, performance is best
+  // with contiguous inputs -- i.e. any combination of row or column major.
+  kBlis,
 };
 
 // Returns the implementation strategy for a dot with the configuration
